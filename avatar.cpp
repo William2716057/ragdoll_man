@@ -14,6 +14,8 @@
 //   R            hard reset to standing at the origin
 //   Left mouse   grab / drag / throw a joint (auto-enables ragdoll)
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
+//   Bed (corner): carry the avatar onto the bed and let go. Lying still for 1 s = asleep.
+//                sleepiness refills while asleep; at 100 it wakes and stands up beside the bed.
 //   UP / DOWN    height            LEFT / RIGHT: build
 //   K / H / C / P  cycle skin / hair / shirt / pants colours
  
@@ -115,9 +117,39 @@ static const float DT    = 1.0f / 120.0f;
 static const int   ITERS = 14;          // constraint iterations per step
  
 // Arena: a square of grass enclosed by walls (inner faces at +/-ARENA metres)
-static const float ARENA  = 6.0f;
+static const float ARENA  = 12.0f;
 static const float WALL_H = 1.0f;
 static const float WALL_T = 0.3f;
+ 
+// Solid objects are axis-aligned boxes that joints cannot enter.
+struct Box { Vector3 min, max; };
+ 
+// The bed sits in the +X/+Z corner with its head against the +Z wall.
+static const float BED_W = 1.1f, BED_L = 2.1f, BED_H = 0.5f;
+static const Box   BED   = {{ARENA - BED_W, 0.0f, ARENA - BED_L}, {ARENA, BED_H, ARENA}};
+ 
+// Sleep / mood tuning
+static const float SLEEP_DROP     = 2.0f;   // sleepiness points lost per tick...
+static const float SLEEP_INTERVAL = 3.0f;   // ...every this many seconds
+static const float SLEEP_REGEN    = 4.0f;   // points per second gained while asleep in bed
+static const float HELD_MOOD_DRAIN= 2.0f;   // mood points per second lost while held by the mouse
+ 
+static bool OverBed(Vector3 p) { return p.x > BED.min.x && p.x < BED.max.x && p.z > BED.min.z && p.z < BED.max.z; }
+ 
+// Push a sphere (centre p, radius r) out of a box along the axis of least penetration.
+// The floor is handled elsewhere, so only the sides and the top matter.
+static void PushOutOfBox(Vector3& p, float r, const Box& b) {
+    float dx0 = p.x - (b.min.x - r), dx1 = (b.max.x + r) - p.x;
+    float dz0 = p.z - (b.min.z - r), dz1 = (b.max.z + r) - p.z;
+    float dy1 = (b.max.y + r) - p.y;
+    if (dx0 <= 0.0f || dx1 <= 0.0f || dz0 <= 0.0f || dz1 <= 0.0f || dy1 <= 0.0f) return;   // outside
+    float m = std::min(std::min(std::min(dx0, dx1), std::min(dz0, dz1)), dy1);
+    if      (m == dy1) p.y = b.max.y + r;
+    else if (m == dx0) p.x = b.min.x - r;
+    else if (m == dx1) p.x = b.max.x + r;
+    else if (m == dz0) p.z = b.min.z - r;
+    else               p.z = b.max.z + r;
+}
  
 struct Stick { int a, b; float lo, hi; };   // allowed length range [lo, hi]
  
@@ -134,6 +166,14 @@ struct Ragdoll {
     float getupT = 0.0f;        // animation clock
     Vector3 origin = {0.0f, 0.0f, 0.0f};   // where the avatar stands (XZ)
     float yaw = 0.0f;                      // which way it faces when standing
+ 
+    // Collision tracking (feeds the mood bar). The game loop reads and clears pendingMoodHit.
+    float pendingMoodHit = 0.0f;           // mood points lost to collisions since last read
+    float impactCooldown = 0.0f;           // merges the many contacts of one fall into one collision
+ 
+    // Bed interaction
+    float bedTimer = 0.0f;                 // time spent lying still on the mattress
+    bool  asleep   = false;
  
     bool  Pinned(int i) const { return mode == MODE_STANDING || i == grabbed; }
     float Radius(int j) const { return (j == HEAD ? 0.065f : 0.03f) * look.height; }
@@ -231,6 +271,7 @@ struct Ragdoll {
     // Snap to the standing pose at the current origin/yaw
     void Stand() {
         mode = MODE_STANDING; grabbed = -1; groundTimer = 0.0f; getupT = 0.0f;
+        bedTimer = 0.0f; asleep = false;
         ComputePose(KEY_STAND, origin, yaw, pos);
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
@@ -256,7 +297,7 @@ struct Ragdoll {
     }
  
     // Decide where/which way to stand up, then start the animation
-    void BeginGetUp() {
+    void BeginGetUp(bool fromBed = false) {
         Vector3 up, fwd;
         BodyFrame(up, fwd);
         origin = {pos[PELVIS].x, 0.0f, pos[PELVIS].z};
@@ -274,11 +315,20 @@ struct Ragdoll {
             else              { fx =  hx; fz =  hz; }   // on front: rise facing where the head points
         }
         yaw = std::atan2(fx, fz);
+        if (fromBed) {                         // step out onto the floor beside the bed (its free side is -X)
+            origin = {BED.min.x - 0.7f, 0.0f, Clamp(pos[PELVIS].z, BED.min.z + 0.2f, BED.max.z - 0.2f)};
+            yaw = -PI * 0.5f;                  // face away from the bed
+        }
         mode = MODE_GETUP;
         getupT = 0.0f;
         groundTimer = 0.0f;
         grabbed = -1;
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
+    }
+ 
+    void WakeUp() {
+        asleep = false; bedTimer = 0.0f;
+        BeginGetUp(true);
     }
  
     void SolveSticks() {
@@ -302,6 +352,7 @@ struct Ragdoll {
         for (int i = 0; i < JOINT_COUNT; i++) {
             if (Pinned(i)) continue;
             pos[i].y = std::max(pos[i].y, Radius(i));
+            PushOutOfBox(pos[i], Radius(i), BED);                // the bed is solid
             const float lim = ARENA - 0.07f * look.height;   // keep the body inside the walls
             pos[i].x = Clamp(pos[i].x, -lim, lim);
             pos[i].z = Clamp(pos[i].z, -lim, lim);
@@ -316,12 +367,47 @@ struct Ragdoll {
             prev[i] = pos[i];
             pos[i] = Vector3Add(Vector3Add(pos[i], vel), Vector3Scale(g, dt * dt));
         }
+ 
+        // Collision detection: how fast is any joint about to hit the floor or a wall?
+        impactCooldown -= dt;
+        {
+            const float lim = ARENA - 0.07f * look.height;
+            float excess = 0.0f;                                   // speed above the "harmless" threshold
+            for (int i = 0; i < JOINT_COUNT; i++) {
+                if (Pinned(i)) continue;
+                Vector3 v = Vector3Scale(Vector3Subtract(pos[i], prev[i]), 1.0f / dt);   // m/s
+                if (pos[i].y < Radius(i) && v.y < 0.0f) excess = std::max(excess, -v.y - 3.0f);        // floor
+                if (OverBed(pos[i]) && pos[i].y < BED_H + Radius(i) && pos[i].y > 0.5f * BED_H && v.y < 0.0f)
+                    excess = std::max(excess, -v.y - 4.0f);                                             // bed (softer)
+                if (pos[i].x >  lim && v.x > 0.0f)      excess = std::max(excess,  v.x - 1.5f);        // walls
+                if (pos[i].x < -lim && v.x < 0.0f)      excess = std::max(excess, -v.x - 1.5f);
+                if (pos[i].z >  lim && v.z > 0.0f)      excess = std::max(excess,  v.z - 1.5f);
+                if (pos[i].z < -lim && v.z < 0.0f)      excess = std::max(excess, -v.z - 1.5f);
+            }
+            if (excess > 0.0f && impactCooldown <= 0.0f) {
+                pendingMoodHit += std::min(3.0f + 2.5f * excess, 25.0f);   // harder hit = bigger mood drop
+                impactCooldown = 0.3f;
+            }
+        }
+ 
         for (int it = 0; it < ITERS; it++) { SolveSticks(); FloorClamp(); }
         for (int i = 0; i < JOINT_COUNT; i++) {              // friction (once per step)
-            if (Pinned(i) || pos[i].y > Radius(i) + 1e-4f) continue;
+            if (Pinned(i)) continue;
+            bool onFloor = pos[i].y <= Radius(i) + 1e-4f;
+            bool onBed   = OverBed(pos[i]) && std::fabs(pos[i].y - (BED_H + Radius(i))) < 1e-3f;
+            if (!onFloor && !onBed) continue;
             prev[i].x += (pos[i].x - prev[i].x) * 0.30f;
             prev[i].z += (pos[i].z - prev[i].z) * 0.30f;
             prev[i].y = pos[i].y;
+        }
+ 
+        // Bed: lying still on the mattress for a second puts the avatar to sleep
+        {
+            const bool over  = OverBed(pos[PELVIS]) && pos[PELVIS].y < BED_H + 0.25f;
+            const float speed = Vector3Length(Vector3Subtract(pos[PELVIS], prev[PELVIS])) / dt;
+            if (grabbed < 0 && over && speed < 0.4f) bedTimer += dt;
+            else if (!over || grabbed >= 0) { bedTimer = 0.0f; asleep = false; }
+            if (bedTimer >= 1.0f) asleep = true;
         }
  
         // Fall detection: pelvis near the floor and nobody holding the avatar
@@ -409,6 +495,54 @@ struct Ragdoll {
 };
  
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Needs / stat bars
+// ----------------------------------------------------------------------------
+static Color MixColor(Color a, Color b, float t) {
+    t = Clamp(t, 0.0f, 1.0f);
+    return {(unsigned char)(a.r + (b.r - a.r) * t), (unsigned char)(a.g + (b.g - a.g) * t),
+            (unsigned char)(a.b + (b.b - a.b) * t), 255};
+}
+ 
+// red (0) -> yellow (50) -> green (100)
+static Color MoodColor(float v) {
+    const Color red = {220, 60, 50, 255}, yellow = {230, 200, 60, 255}, green = {70, 190, 80, 255};
+    float t = Clamp(v / 100.0f, 0.0f, 1.0f);
+    return t < 0.5f ? MixColor(red, yellow, t * 2.0f) : MixColor(yellow, green, (t - 0.5f) * 2.0f);
+}
+ 
+// light blue (full) -> dark blue (empty)
+static Color SleepColor(float v) {
+    const Color dark = {20, 50, 150, 255}, light = {150, 210, 255, 255};
+    return MixColor(dark, light, v / 100.0f);
+}
+ 
+static void DrawStatBar(int x, int y, const char* label, float value, Color fill) {
+    const int w = 160, h = 18, lx = 100;     // lx = label column width
+    DrawText(label, x, y, 18, DARKGRAY);
+    DrawRectangle(x + lx, y, w, h, {50, 50, 50, 170});
+    DrawRectangle(x + lx, y, (int)(w * Clamp(value, 0.0f, 100.0f) / 100.0f), h, fill);
+    DrawRectangleLines(x + lx, y, w, h, {30, 30, 30, 255});
+    DrawText(TextFormat("%.0f", value), x + lx + w + 8, y, 18, DARKGRAY);
+}
+ 
+static void DrawBed() {
+    const float cx = (BED.min.x + BED.max.x) * 0.5f, cz = (BED.min.z + BED.max.z) * 0.5f;
+    const Color frame = {120, 85, 60, 255}, frameEdge = {80, 55, 40, 255};
+    const Color mattress = {236, 236, 244, 255}, blanket = {110, 140, 205, 255}, pillow = {255, 255, 255, 255};
+ 
+    // frame (solid up to 0.30 m), mattress up to BED_H
+    DrawCube({cx, 0.15f, cz}, BED_W, 0.30f, BED_L, frame);
+    DrawCubeWires({cx, 0.15f, cz}, BED_W, 0.30f, BED_L, frameEdge);
+    DrawCube({cx, 0.40f, cz}, BED_W - 0.08f, BED_H - 0.30f, BED_L - 0.08f, mattress);
+    // blanket over the foot end, pillow + headboard at the wall end (+Z)
+    const float bl = (BED_L - 0.08f) * 0.6f;
+    DrawCube({cx, 0.40f, BED.min.z + 0.04f + bl * 0.5f}, BED_W - 0.04f, BED_H - 0.30f + 0.01f, bl, blanket);
+    DrawCube({cx, BED_H + 0.05f, BED.max.z - 0.35f}, BED_W * 0.65f, 0.10f, 0.40f, pillow);
+    DrawCube({cx, 0.45f, BED.max.z - 0.04f}, BED_W, 0.90f, 0.08f, frame);
+    DrawCubeWires({cx, 0.45f, BED.max.z - 0.04f}, BED_W, 0.90f, 0.08f, frameEdge);
+}
+ 
 static void DrawArena() {
     const Color grass    = { 88, 156,  72, 255};
     const Color outer    = { 62, 118,  56, 255};
@@ -452,6 +586,12 @@ int main() {
     float yaw = 0.6f, pitch = 0.25f, dist = 4.0f;
     float grabDist = 0.0f;
     bool  draggingCam = false;              // left-drag that started on empty space
+ 
+    // Needs (0..100). Health and hunger are placeholders for now; only mood is live.
+    float health = 100.0f, hunger = 100.0f, mood = 100.0f;
+    float moodTick = 0.0f;                  // counts up to 1 s, then mood recovers by 1 point
+    float sleepiness = 100.0f;              // 100 = rested (light blue), 0 = exhausted (dark blue)
+    float sleepTick = 0.0f;                 // counts up to SLEEP_INTERVAL, then sleepiness drops
     Vector3 focus = {0.0f, 0.0f, 0.0f};     // camera follows the avatar on the ground plane
  
     while (!WindowShouldClose()) {
@@ -462,7 +602,7 @@ int main() {
             pitch += d.y * 0.005f;
             pitch = Clamp(pitch, -0.1f, 1.45f);
         }
-        dist = Clamp(dist - GetMouseWheelMove() * 0.3f, 1.5f, 9.0f);
+        dist = Clamp(dist - GetMouseWheelMove() * 0.3f, 1.5f, 14.0f);
  
         focus.x = Lerp(focus.x, avatar.pos[PELVIS].x, 0.05f);
         focus.z = Lerp(focus.z, avatar.pos[PELVIS].z, 0.05f);
@@ -519,6 +659,7 @@ int main() {
             t.x = Clamp(t.x, -lim, lim);
             t.z = Clamp(t.z, -lim, lim);
             t.y = std::max(t.y, 0.03f);
+            PushOutOfBox(t, 0.05f, BED);                                // ...or through the bed
             avatar.prev[avatar.grabbed] = avatar.pos[avatar.grabbed];
             avatar.pos[avatar.grabbed]  = t;
         }
@@ -526,22 +667,53 @@ int main() {
  
         for (int i = 0; i < STEPS; i++) avatar.Step(DT);
  
+        // ---- mood: drops on collisions, recovers +1 every second ----
+        mood -= avatar.pendingMoodHit;
+        avatar.pendingMoodHit = 0.0f;
+        moodTick += GetFrameTime();
+        while (moodTick >= 1.0f) { moodTick -= 1.0f; mood += 1.0f; }
+        if (avatar.grabbed >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT))        // being held isn't fun
+            mood -= HELD_MOOD_DRAIN * GetFrameTime();
+        mood = Clamp(mood, 0.0f, 100.0f);
+ 
+        // ---- sleepiness: drops every SLEEP_INTERVAL s, refills while asleep in the bed ----
+        if (avatar.asleep) {
+            sleepiness += SLEEP_REGEN * GetFrameTime();
+            if (sleepiness >= 100.0f) { sleepiness = 100.0f; avatar.WakeUp(); }
+        } else {
+            sleepTick += GetFrameTime();
+            while (sleepTick >= SLEEP_INTERVAL) { sleepTick -= SLEEP_INTERVAL; sleepiness -= SLEEP_DROP; }
+        }
+        sleepiness = Clamp(sleepiness, 0.0f, 100.0f);
+ 
         // ---- draw ----
         BeginDrawing();
         ClearBackground({205, 220, 235, 255});
         BeginMode3D(cam);
             DrawArena();
+            DrawBed();
             avatar.Draw();
         EndMode3D();
+ 
+        if (avatar.asleep) {                                    // floating "Zzz" above the sleeping head
+            Vector2 sp = GetWorldToScreen(Vector3Add(avatar.pos[HEAD], {0.0f, 0.35f, 0.0f}), cam);
+            DrawText("Zzz", (int)sp.x, (int)(sp.y + 6.0f * std::sin((float)GetTime() * 2.0f)), 26, DARKBLUE);
+        }
  
         DrawText("SPACE knock over   R reset   drag avatar joint / drag empty space = turn camera   Wheel zoom", 12, 10, 18, DARKGRAY);
         DrawText("UP/DOWN height   LEFT/RIGHT build   K skin  H hair  C shirt  P pants", 12, 34, 18, DARKGRAY);
         const char* state = "STANDING";
         if (avatar.mode == MODE_GETUP) state = "GETTING UP";
         else if (avatar.mode == MODE_RAGDOLL)
-            state = avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
+            state = avatar.asleep ? "ASLEEP" : avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
                                               : "RAGDOLL";
         DrawText(TextFormat("height %.2f m   build %.1f   %s", look.height, look.build, state), 12, 58, 18, DARKGRAY);
+ 
+        const int px = GetScreenWidth() - 310;
+        DrawStatBar(px, 12, "Health", health, {220, 70, 70, 255});
+        DrawStatBar(px, 38, "Mood",   mood,   MoodColor(mood));
+        DrawStatBar(px, 64, "Hunger", hunger, {230, 160, 50, 255});
+        DrawStatBar(px, 90, "Sleepiness", sleepiness, SleepColor(sleepiness));
         EndDrawing();
     }
     CloseWindow();
