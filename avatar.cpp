@@ -16,6 +16,10 @@
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
 //   Bed (corner): carry the avatar onto the bed and let go. Lying still for 1 s = asleep.
 //                sleepiness refills while asleep; at 100 it wakes and stands up beside the bed.
+//   Mood > 60: he dances for 2.5 s at random intervals.  Mood < 25: he cries (hands over his face).
+//   M / N        test shortcuts: set mood to 15 (sad) / 100 (happy)
+//   Z            make him sleepy right now (sets sleepiness to the go-to-bed level)
+//   Below 25 sleepiness a standing avatar walks to the bed, sits on the edge, lies down and sleeps.
 //   UP / DOWN    height            LEFT / RIGHT: build
 //   K / H / C / P  cycle skin / hair / shirt / pants colours
  
@@ -36,7 +40,7 @@ enum Joint {
     JOINT_COUNT
 };
  
-enum Mode { MODE_STANDING, MODE_RAGDOLL, MODE_GETUP };
+enum Mode { MODE_STANDING, MODE_RAGDOLL, MODE_GETUP, MODE_WALK, MODE_BEDANIM };
  
 struct Appearance {
     float height = 1.75f;   // metres
@@ -75,6 +79,14 @@ static PoseKey KeyLerp(const PoseKey& a, const PoseKey& b, float t) {
     return r;
 }
 static float Smooth(float t) { t = Clamp(t, 0.0f, 1.0f); return t * t * (3.0f - 2.0f * t); }
+ 
+// Extra adjustments layered on a PoseKey (lengths in body heights, local frame): used by emotes.
+struct PoseTweak {
+    float   pelvisX   = 0.0f;                    // sideways hip sway
+    Vector3 lHand = {0, 0, 0}, rHand = {0, 0, 0};   // added to the hand targets
+    Vector3 lFoot = {0, 0, 0}, rFoot = {0, 0, 0};   // added to the foot targets
+    float   coverFace = 0.0f;                    // 0..1: bring both hands up over the eyes
+};
  
 // Timing (seconds)
 static const float FALL_WAIT      = 0.5f;   // time on the ground before getting up
@@ -129,10 +141,30 @@ static const float BED_W = 1.1f, BED_L = 2.1f, BED_H = 0.5f;
 static const Box   BED   = {{ARENA - BED_W, 0.0f, ARENA - BED_L}, {ARENA, BED_H, ARENA}};
  
 // Sleep / mood tuning
-static const float SLEEP_DROP     = 2.0f;   // sleepiness points lost per tick...
+static const float SLEEP_DROP     = 1.0f;   // sleepiness points lost per tick...
 static const float SLEEP_INTERVAL = 3.0f;   // ...every this many seconds
-static const float SLEEP_REGEN    = 4.0f;   // points per second gained while asleep in bed
+static const float SLEEP_REGEN    = 2.0f;   // points per second gained while asleep in bed
 static const float HELD_MOOD_DRAIN= 2.0f;   // mood points per second lost while held by the mouse
+static const float MOOD_REGEN_INTERVAL = 2.0f;   // mood recovers 1 point every this many seconds
+ 
+// Emotes (standing only)
+static const float MOOD_DANCE_ABOVE = 60.0f;    // above this he dances now and then
+static const float MOOD_CRY_BELOW   = 25.0f;    // below this he covers his face and cries
+static const float DANCE_TIME       = 2.5f;     // seconds per dance
+ 
+// Going to bed: below this sleepiness the avatar walks to the bed by itself
+static const float SLEEPY_AT   = 25.0f;
+static const float WALK_SPEED  = 1.1f;      // m/s
+static const float TURN_RATE   = 4.0f;      // rad/s
+static const float BED_LIE_Z   = BED.max.z - 0.95f;   // where along the bed the pelvis ends up lying
+static const float BED_SIT_T   = 1.2f;      // seconds: turn around + sit on the edge
+static const float BED_LIE_T   = 1.5f;      // seconds: lie back and swing the legs up
+ 
+static float WrapPi(float a) {
+    while (a >  PI) a -= 2.0f * PI;
+    while (a < -PI) a += 2.0f * PI;
+    return a;
+}
  
 static bool OverBed(Vector3 p) { return p.x > BED.min.x && p.x < BED.max.x && p.z > BED.min.z && p.z < BED.max.z; }
  
@@ -173,9 +205,25 @@ struct Ragdoll {
  
     // Bed interaction
     float bedTimer = 0.0f;                 // time spent lying still on the mattress
+    int   walkStage = 0;                   // 0 = pick route, 1 = via the corner waypoint, 2 = to the bedside
+    float gaitPhase = 0.0f;                // walk cycle position (radians)
+    float gaitAmp   = 0.0f;                // 0 = standing, 1 = full stride (ramps in/out)
+    float bedT      = 0.0f;                // clock of the bed animation (runs backwards when getting out)
+    bool  bedReverse = false;              // true while getting OUT of bed
+    float wakeBlend = 0.0f;                // 0..1: eases from wherever he was lying into the animation
+    Vector3 wakeStart[JOINT_COUNT];
+ 
+    // Emotes (set moodLevel from the game loop each frame)
+    float moodLevel   = 100.0f;
+    float danceT      = 0.0f;                  // seconds of the current dance left (0 = not dancing)
+    float danceClock  = 0.0f;                  // drives the dance moves
+    float danceBlend  = 0.0f;                  // 0..1 ease in/out of the dance pose
+    float cryBlend    = 0.0f;                  // 0..1 ease in/out of hands-on-face
+    float emoteClock  = 0.0f;
+    float nextDanceIn = 5.0f;                  // random countdown to the next dance
     bool  asleep   = false;
  
-    bool  Pinned(int i) const { return mode == MODE_STANDING || i == grabbed; }
+    bool  Pinned(int i) const { return mode == MODE_STANDING || mode == MODE_WALK || mode == MODE_BEDANIM || i == grabbed; }
     float Radius(int j) const { return (j == HEAD ? 0.065f : 0.03f) * look.height; }
     float Bone(int a, int b) const { return Vector3Distance(rest[a], rest[b]); }
  
@@ -233,14 +281,15 @@ struct Ragdoll {
  
     // Generate a full-body pose from a keyframe (IK for the limbs), placed at
     // `org` (XZ) and rotated by `yw` about the Y axis.
-    void ComputePose(const PoseKey& k, Vector3 org, float yw, Vector3 out[JOINT_COUNT]) const {
+    void ComputePose(const PoseKey& k, Vector3 org, float yw, Vector3 out[JOINT_COUNT],
+                     float gait = 0.0f, float gaitStrength = 0.0f, const PoseTweak* tw = nullptr) const {
         const float H = look.height, b = look.build;
         const float cl = std::cos(k.lean * DEG2RAD), sl = std::sin(k.lean * DEG2RAD);
         const float cy = std::cos(yw), sy = std::sin(yw);
         Vector3 loc[JOINT_COUNT];
  
         // Torso + hips move as one rigid block, pitched about the pelvis
-        Vector3 pel = {0.0f, k.pelvisY * H, k.pelvisZ * H};
+        Vector3 pel = {(tw ? tw->pelvisX : 0.0f) * H, k.pelvisY * H, k.pelvisZ * H};
         loc[PELVIS] = pel;
         for (int j : {HEAD, NECK, L_SHO, R_SHO, CHEST_F, L_HIP, R_HIP}) {
             Vector3 o = Vector3Subtract(rest[j], rest[PELVIS]);
@@ -255,11 +304,38 @@ struct Ragdoll {
         loc[L_HAND] = {+k.handX * b * H, k.handY * H, k.handZ * H};
         loc[R_HAND] = {-k.handX * b * H, k.handY * H, k.handZ * H};
  
+        if (gaitStrength > 0.0f) {                       // walk cycle: feet swing + lift, arms swing the other way
+            const float sL = std::sin(gait), cL = std::cos(gait);
+            loc[L_FOOT].z += sL * 0.12f * H * gaitStrength;  loc[L_FOOT].y += std::max(0.0f,  cL) * 0.05f * H * gaitStrength;
+            loc[R_FOOT].z -= sL * 0.12f * H * gaitStrength;  loc[R_FOOT].y += std::max(0.0f, -cL) * 0.05f * H * gaitStrength;
+            loc[L_HAND].z -= sL * 0.09f * H * gaitStrength;
+            loc[R_HAND].z += sL * 0.09f * H * gaitStrength;
+        }
+ 
         const Vector3 fwd = {0.0f, 0.0f, 1.0f}, back = {0.0f, 0.0f, -1.0f};
+        Vector3 bendL = back, bendR = back;               // which way the elbows point
+        if (tw) {
+            loc[L_HAND] = Vector3Add(loc[L_HAND], Vector3Scale(tw->lHand, H));
+            loc[R_HAND] = Vector3Add(loc[R_HAND], Vector3Scale(tw->rHand, H));
+            loc[L_FOOT] = Vector3Add(loc[L_FOOT], Vector3Scale(tw->lFoot, H));
+            loc[R_FOOT] = Vector3Add(loc[R_FOOT], Vector3Scale(tw->rFoot, H));
+            if (tw->coverFace > 0.0f) {                   // hands over the eyes, elbows out and down
+                const float c = tw->coverFace;
+                const Vector3 faceDir = {0.0f, -sl, cl};  // where the face points once the torso leans
+                Vector3 centre = Vector3Add(loc[HEAD], Vector3Scale(faceDir, 0.095f * H));
+                centre.y += 0.005f * H;
+                const Vector3 faceL = {centre.x + 0.035f * H, centre.y, centre.z};
+                const Vector3 faceR = {centre.x - 0.035f * H, centre.y, centre.z};
+                loc[L_HAND] = Vector3Lerp(loc[L_HAND], faceL, c);
+                loc[R_HAND] = Vector3Lerp(loc[R_HAND], faceR, c);
+                bendL = Vector3Lerp(back, {+0.4f, -1.0f, 0.1f}, c);
+                bendR = Vector3Lerp(back, {-0.4f, -1.0f, 0.1f}, c);
+            }
+        }
         loc[L_KNEE] = TwoBone(loc[L_HIP], loc[L_FOOT], Bone(L_HIP, L_KNEE), Bone(L_KNEE, L_FOOT), fwd);
         loc[R_KNEE] = TwoBone(loc[R_HIP], loc[R_FOOT], Bone(R_HIP, R_KNEE), Bone(R_KNEE, R_FOOT), fwd);
-        loc[L_ELB]  = TwoBone(loc[L_SHO], loc[L_HAND], Bone(L_SHO, L_ELB),  Bone(L_ELB, L_HAND),  back);
-        loc[R_ELB]  = TwoBone(loc[R_SHO], loc[R_HAND], Bone(R_SHO, R_ELB),  Bone(R_ELB, R_HAND),  back);
+        loc[L_ELB]  = TwoBone(loc[L_SHO], loc[L_HAND], Bone(L_SHO, L_ELB),  Bone(L_ELB, L_HAND),  bendL);
+        loc[R_ELB]  = TwoBone(loc[R_SHO], loc[R_HAND], Bone(R_SHO, R_ELB),  Bone(R_ELB, R_HAND),  bendR);
  
         for (int j = 0; j < JOINT_COUNT; j++) {
             out[j] = {org.x + loc[j].x * cy + loc[j].z * sy,
@@ -271,7 +347,8 @@ struct Ragdoll {
     // Snap to the standing pose at the current origin/yaw
     void Stand() {
         mode = MODE_STANDING; grabbed = -1; groundTimer = 0.0f; getupT = 0.0f;
-        bedTimer = 0.0f; asleep = false;
+        bedTimer = 0.0f; asleep = false; walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f; bedT = 0.0f; bedReverse = false;
+        danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
         ComputePose(KEY_STAND, origin, yaw, pos);
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
@@ -281,7 +358,7 @@ struct Ragdoll {
     // Switch to physics. `push` gives the upper body a shove so it topples.
     void GoLimp(bool push) {
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
-        mode = MODE_RAGDOLL; groundTimer = 0.0f; getupT = 0.0f;
+        mode = MODE_RAGDOLL; groundTimer = 0.0f; getupT = 0.0f; bedReverse = false;
         if (push) {
             float a = (float)GetRandomValue(0, 628) / 100.0f;
             Vector3 dir = {std::sin(a), 0.0f, std::cos(a)};
@@ -297,7 +374,7 @@ struct Ragdoll {
     }
  
     // Decide where/which way to stand up, then start the animation
-    void BeginGetUp(bool fromBed = false) {
+    void BeginGetUp() {
         Vector3 up, fwd;
         BodyFrame(up, fwd);
         origin = {pos[PELVIS].x, 0.0f, pos[PELVIS].z};
@@ -315,10 +392,6 @@ struct Ragdoll {
             else              { fx =  hx; fz =  hz; }   // on front: rise facing where the head points
         }
         yaw = std::atan2(fx, fz);
-        if (fromBed) {                         // step out onto the floor beside the bed (its free side is -X)
-            origin = {BED.min.x - 0.7f, 0.0f, Clamp(pos[PELVIS].z, BED.min.z + 0.2f, BED.max.z - 0.2f)};
-            yaw = -PI * 0.5f;                  // face away from the bed
-        }
         mode = MODE_GETUP;
         getupT = 0.0f;
         groundTimer = 0.0f;
@@ -326,9 +399,12 @@ struct Ragdoll {
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
  
+    // Get out of bed: the get-into-bed animation in reverse (lie -> sit on the edge -> stand beside the bed)
     void WakeUp() {
-        asleep = false; bedTimer = 0.0f;
-        BeginGetUp(true);
+        asleep = false; bedTimer = 0.0f; grabbed = -1;
+        for (int i = 0; i < JOINT_COUNT; i++) wakeStart[i] = pos[i];
+        mode = MODE_BEDANIM; bedReverse = true; wakeBlend = 0.0f;
+        bedT = BED_SIT_T + BED_LIE_T;
     }
  
     void SolveSticks() {
@@ -428,9 +504,159 @@ struct Ragdoll {
         if (getupT >= GETUP_TOTAL) Stand();                  // seamless: same pose as the last key
     }
  
+    // ------------------------------------------------------------------------
+    // Walking to the bed and getting in
+    // ------------------------------------------------------------------------
+    static Vector3 BedsideSpot()  { return {BED.min.x - 0.45f, 0.0f, BED_LIE_Z}; }                 // standing spot beside the bed
+    static Vector3 CornerSpot()   { return {BED.min.x - 0.60f, 0.0f, BED.min.z - 0.60f}; }         // waypoint round the foot of the bed
+ 
+    void StartWalkToBed() {
+        mode = MODE_WALK; grabbed = -1;
+        walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f; bedReverse = false;
+        danceT = 0.0f; danceBlend = 0.0f;
+    }
+ 
+    void StepWalk(float dt) {
+        if (walkStage == 0)   // pick a route that never cuts through the bed
+            walkStage = (origin.x > BED.min.x - 0.2f && origin.z < BED.min.z - 0.1f) ? 1 : 2;
+ 
+        const Vector3 goal = (walkStage == 1) ? CornerSpot() : BedsideSpot();
+        float dx = goal.x - origin.x, dz = goal.z - origin.z;
+        float dist = std::sqrt(dx * dx + dz * dz);
+        bool  arrived = dist < 0.05f;
+ 
+        float wantYaw = arrived ? PI * 0.5f : std::atan2(dx, dz);        // at the bedside: face the bed (+X)
+        float dyaw = WrapPi(wantYaw - yaw);
+        float maxTurn = TURN_RATE * dt;
+        yaw += Clamp(dyaw, -maxTurn, maxTurn);
+ 
+        bool moving = !arrived && std::fabs(dyaw) < 0.6f;                // turn on the spot first if facing the wrong way
+        if (moving) {
+            float step = std::min(WALK_SPEED * dt, dist);
+            origin.x += std::sin(yaw) * step;
+            origin.z += std::cos(yaw) * step;
+        }
+        if (arrived && walkStage == 1) { walkStage = 2; arrived = false; }
+ 
+        // gait: full stride while moving, small shuffle while turning, fade out when done
+        float targetAmp = moving ? 1.0f : (arrived ? 0.0f : 0.5f);
+        gaitAmp += Clamp(targetAmp - gaitAmp, -4.0f * dt, 4.0f * dt);
+        gaitPhase += (moving ? 5.5f : 2.5f) * dt;
+ 
+        PoseKey k = KEY_STAND;
+        k.pelvisY = 0.515f - 0.022f * gaitAmp - 0.010f * gaitAmp * std::fabs(std::sin(gaitPhase));   // knees soften, body bobs
+        k.lean = 4.0f * gaitAmp;
+        k.lean += 6.0f * cryBlend;
+        UpdateEmotes(dt, false, arrived && walkStage == 2);   // keeps crying on the way, settles at the bedside
+        PoseTweak tw; tw.coverFace = cryBlend;
+        ComputePose(k, origin, yaw, pos, gaitPhase, gaitAmp, &tw);
+        for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
+ 
+        if (arrived && walkStage == 2 && std::fabs(WrapPi(PI * 0.5f - yaw)) < 0.05f && gaitAmp < 0.05f && cryBlend < 0.01f) {
+            origin = BedsideSpot(); yaw = PI * 0.5f;
+            mode = MODE_BEDANIM; bedT = 0.0f; bedReverse = false;
+        }
+    }
+ 
+    struct BedKey { PoseKey k; float x, z, yaw; };
+ 
+    void StepBedAnim(float dt) {
+        if (!bedReverse) bedT += dt;
+        else if (wakeBlend < 1.0f) wakeBlend = std::min(1.0f, wakeBlend + dt / 0.4f);   // first settle into the lying pose
+        else bedT -= dt;
+        const float H = look.height;
+        const Vector3 sp = BedsideSpot();
+        const float cx = (BED.min.x + BED.max.x) * 0.5f;
+ 
+        const BedKey stand = {KEY_STAND, sp.x, sp.z, PI * 0.5f};
+        // Sit on the edge facing out (-X), feet on the floor
+        const BedKey sit = {{(BED_H + 0.09f) / H, 0.0f, 8.0f, 0.07f, 0.04f, 0.28f, 0.10f, (BED_H + 0.14f) / H, 0.08f},
+                            BED.min.x + 0.20f, sp.z, PI * 1.5f};
+        // Lie on the back, head to the +Z wall, feet toward the foot of the bed
+        const float lieY = (BED_H + 0.06f) / H;
+        const BedKey lie = {{lieY, 0.0f, -90.0f, 0.06f, lieY, 0.50f, 0.16f, lieY, -0.03f},
+                            cx, BED_LIE_Z, PI};
+ 
+        BedKey a, b; float s;
+        if (bedT < BED_SIT_T)                { a = stand; b = sit; s = Smooth(bedT / BED_SIT_T); }
+        else if (bedT < BED_SIT_T + BED_LIE_T) { a = sit;   b = lie; s = Smooth((bedT - BED_SIT_T) / BED_LIE_T); }
+        else                                 { a = lie;   b = lie; s = 1.0f; }
+ 
+        PoseKey k = KeyLerp(a.k, b.k, s);
+        Vector3 org = {a.x + (b.x - a.x) * s, 0.0f, a.z + (b.z - a.z) * s};
+        float   yw  = a.yaw + (b.yaw - a.yaw) * s;
+        Vector3 target[JOINT_COUNT];
+        ComputePose(k, org, yw, target);
+        const float bl = bedReverse ? Smooth(wakeBlend) : 1.0f;
+        for (int i = 0; i < JOINT_COUNT; i++) {
+            pos[i] = bedReverse ? Vector3Lerp(wakeStart[i], target[i], bl) : target[i];
+            prev[i] = pos[i];
+        }
+ 
+        if (!bedReverse && bedT >= BED_SIT_T + BED_LIE_T + 0.15f) GoLimp(false);   // settle onto the mattress; asleep after 1 s of lying still
+        if (bedReverse && bedT <= 0.0f) { origin = BedsideSpot(); yaw = PI * 0.5f; Stand(); }
+    }
+ 
+    // ------------------------------------------------------------------------
+    // Emotes: dance when happy, cry when miserable
+    // ------------------------------------------------------------------------
+    void UpdateEmotes(float dt, bool allowDance, bool calm = false) {
+        emoteClock += dt;
+        if (moodLevel < MOOD_CRY_BELOW) danceT = 0.0f;              // too sad to dance
+        if (danceT > 0.0f) {
+            danceT -= dt;
+            if (danceT <= 0.0f) { danceT = 0.0f; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f; }   // next one in 3-10 s
+        } else if (allowDance && moodLevel > MOOD_DANCE_ABOVE) {
+            nextDanceIn -= dt;
+            if (nextDanceIn <= 0.0f) { danceT = DANCE_TIME; danceClock = 0.0f; }
+        }
+        if (danceT > 0.0f || danceBlend > 0.0f) danceClock += dt;
+        const float dTarget = danceT > 0.0f ? 1.0f : 0.0f;
+        const float cTarget = (!calm && moodLevel < MOOD_CRY_BELOW) ? 1.0f : 0.0f;
+        danceBlend += Clamp(dTarget - danceBlend, -6.0f * dt, 6.0f * dt);
+        cryBlend   += Clamp(cTarget - cryBlend,   -2.5f * dt, 2.5f * dt);
+    }
+ 
+    // Layer the current emotes onto a key/tweak; returns an extra yaw (the dance shimmy).
+    float ApplyEmotes(PoseKey& k, PoseTweak& tw) const {
+        float yawOff = 0.0f;
+        if (danceBlend > 0.0f) {
+            const float t = danceClock, db = danceBlend;
+            const float bounce = std::cos(4.0f * PI * t);            // 2 beats per second
+            const float sway   = std::sin(2.0f * PI * t);
+            const float pump   = std::sin(4.0f * PI * t);
+            k.pelvisY -= db * (0.035f + 0.020f * bounce);            // knees bend on the beat
+            tw.pelvisX += db * 0.035f * sway;                        // hips swing side to side
+            yawOff     += db * 0.45f * std::cos(2.0f * PI * t);      // shoulders twist
+            tw.lHand.x += 0.06f * db;  tw.lHand.y += db * (0.46f + 0.10f * pump);        // arms up, pumping in turn
+            tw.rHand.x -= 0.06f * db;  tw.rHand.y += db * (0.46f - 0.10f * pump);
+            tw.lFoot.y += db * 0.045f * std::max(0.0f,  sway);       // step from foot to foot
+            tw.rFoot.y += db * 0.045f * std::max(0.0f, -sway);
+        }
+        if (cryBlend > 0.0f) {
+            const float cb = cryBlend, sob = std::sin(2.0f * PI * 3.0f * emoteClock);
+            k.lean    += cb * (8.0f + 1.5f * sob);                   // head bowed, shoulders shaking
+            k.pelvisY -= cb * 0.012f;
+            tw.coverFace = cb;
+        }
+        return yawOff;
+    }
+ 
+    void StepStanding(float dt) {
+        UpdateEmotes(dt, true);
+        PoseKey k = KEY_STAND;
+        PoseTweak tw;
+        float yawOff = ApplyEmotes(k, tw);
+        ComputePose(k, origin, yaw + yawOff, pos, 0.0f, 0.0f, &tw);
+        for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
+    }
+ 
     void Step(float dt) {
-        if (mode == MODE_RAGDOLL) StepRagdoll(dt);
+        if (mode == MODE_STANDING) StepStanding(dt);
+        else if (mode == MODE_RAGDOLL) StepRagdoll(dt);
         else if (mode == MODE_GETUP) StepGetUp(dt);
+        else if (mode == MODE_WALK) StepWalk(dt);
+        else if (mode == MODE_BEDANIM) StepBedAnim(dt);
     }
  
     void Release() {
@@ -589,7 +815,7 @@ int main() {
  
     // Needs (0..100). Health and hunger are placeholders for now; only mood is live.
     float health = 100.0f, hunger = 100.0f, mood = 100.0f;
-    float moodTick = 0.0f;                  // counts up to 1 s, then mood recovers by 1 point
+    float moodTick = 0.0f;                  // counts up to MOOD_REGEN_INTERVAL, then mood recovers by 1 point
     float sleepiness = 100.0f;              // 100 = rested (light blue), 0 = exhausted (dark blue)
     float sleepTick = 0.0f;                 // counts up to SLEEP_INTERVAL, then sleepiness drops
     Vector3 focus = {0.0f, 0.0f, 0.0f};     // camera follows the avatar on the ground plane
@@ -634,7 +860,10 @@ int main() {
  
         // ---- pose / physics control ----
         if (IsKeyPressed(KEY_R)) avatar.HardReset();
-        if (IsKeyPressed(KEY_SPACE) && avatar.mode == MODE_STANDING) avatar.GoLimp(true);   // knock over
+        if (IsKeyPressed(KEY_SPACE) && (avatar.mode == MODE_STANDING || avatar.mode == MODE_WALK)) avatar.GoLimp(true);   // knock over
+        if (IsKeyPressed(KEY_M)) mood = 15.0f;                                     // test shortcuts: sad ...
+        if (IsKeyPressed(KEY_N)) mood = 100.0f;                                    // ... and happy
+        if (IsKeyPressed(KEY_Z)) sleepiness = std::min(sleepiness, SLEEPY_AT);     // test shortcut: make him sleepy now
  
         // ---- mouse grab ----
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -665,13 +894,14 @@ int main() {
         }
         if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) { avatar.Release(); draggingCam = false; }
  
+        avatar.moodLevel = mood;
         for (int i = 0; i < STEPS; i++) avatar.Step(DT);
  
         // ---- mood: drops on collisions, recovers +1 every second ----
         mood -= avatar.pendingMoodHit;
         avatar.pendingMoodHit = 0.0f;
         moodTick += GetFrameTime();
-        while (moodTick >= 1.0f) { moodTick -= 1.0f; mood += 1.0f; }
+        while (moodTick >= MOOD_REGEN_INTERVAL) { moodTick -= MOOD_REGEN_INTERVAL; mood += 1.0f; }
         if (avatar.grabbed >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT))        // being held isn't fun
             mood -= HELD_MOOD_DRAIN * GetFrameTime();
         mood = Clamp(mood, 0.0f, 100.0f);
@@ -685,6 +915,9 @@ int main() {
             while (sleepTick >= SLEEP_INTERVAL) { sleepTick -= SLEEP_INTERVAL; sleepiness -= SLEEP_DROP; }
         }
         sleepiness = Clamp(sleepiness, 0.0f, 100.0f);
+        // Tired enough (and on his feet)? Walk to the bed.
+        if (avatar.mode == MODE_STANDING && sleepiness <= SLEEPY_AT && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f)
+            avatar.StartWalkToBed();                            // (a dance in progress finishes first)
  
         // ---- draw ----
         BeginDrawing();
@@ -703,7 +936,11 @@ int main() {
         DrawText("SPACE knock over   R reset   drag avatar joint / drag empty space = turn camera   Wheel zoom", 12, 10, 18, DARKGRAY);
         DrawText("UP/DOWN height   LEFT/RIGHT build   K skin  H hair  C shirt  P pants", 12, 34, 18, DARKGRAY);
         const char* state = "STANDING";
+        if (avatar.mode == MODE_STANDING && avatar.danceT > 0.0f) state = "DANCING";
+        else if (avatar.mode == MODE_STANDING && avatar.cryBlend > 0.5f) state = "CRYING";
         if (avatar.mode == MODE_GETUP) state = "GETTING UP";
+        else if (avatar.mode == MODE_WALK) state = "WALKING TO BED";
+        else if (avatar.mode == MODE_BEDANIM) state = avatar.bedReverse ? "GETTING OUT OF BED" : "GETTING INTO BED";
         else if (avatar.mode == MODE_RAGDOLL)
             state = avatar.asleep ? "ASLEEP" : avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
                                               : "RAGDOLL";
@@ -714,6 +951,7 @@ int main() {
         DrawStatBar(px, 38, "Mood",   mood,   MoodColor(mood));
         DrawStatBar(px, 64, "Hunger", hunger, {230, 160, 50, 255});
         DrawStatBar(px, 90, "Sleepiness", sleepiness, SleepColor(sleepiness));
+        DrawLine(px + 100 + (int)(160 * SLEEPY_AT / 100.0f), 90, px + 100 + (int)(160 * SLEEPY_AT / 100.0f), 108, WHITE);   // "goes to bed" mark
         EndDrawing();
     }
     CloseWindow();
