@@ -13,7 +13,7 @@
 //   SPACE        knock the avatar over
 //   R            hard reset to standing at the origin
 //   Left mouse   grab / drag / throw a joint (auto-enables ragdoll)
-//   Right mouse  orbit camera      Wheel: zoom
+//   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
 //   UP / DOWN    height            LEFT / RIGHT: build
 //   K / H / C / P  cycle skin / hair / shirt / pants colours
  
@@ -113,6 +113,11 @@ static Vector3 TwoBone(Vector3 a, Vector3& c, float l1, float l2, Vector3 bend) 
 static const int   STEPS = 2;           // physics sub-steps per frame
 static const float DT    = 1.0f / 120.0f;
 static const int   ITERS = 14;          // constraint iterations per step
+ 
+// Arena: a square of grass enclosed by walls (inner faces at +/-ARENA metres)
+static const float ARENA  = 6.0f;
+static const float WALL_H = 1.0f;
+static const float WALL_T = 0.3f;
  
 struct Stick { int a, b; float lo, hi; };   // allowed length range [lo, hi]
  
@@ -297,6 +302,9 @@ struct Ragdoll {
         for (int i = 0; i < JOINT_COUNT; i++) {
             if (Pinned(i)) continue;
             pos[i].y = std::max(pos[i].y, Radius(i));
+            const float lim = ARENA - 0.07f * look.height;   // keep the body inside the walls
+            pos[i].x = Clamp(pos[i].x, -lim, lim);
+            pos[i].z = Clamp(pos[i].z, -lim, lim);
         }
     }
  
@@ -401,6 +409,31 @@ struct Ragdoll {
 };
  
 // ----------------------------------------------------------------------------
+static void DrawArena() {
+    const Color grass    = { 88, 156,  72, 255};
+    const Color outer    = { 62, 118,  56, 255};
+    const Color gridLine = { 25,  85,  35,  60};   // faint
+    const Color wall     = {164, 132,  98, 255};
+    const Color wallEdge = {110,  86,  62, 255};
+ 
+    DrawPlane({0.0f, -0.03f, 0.0f}, {80.0f, 80.0f}, outer);
+    DrawPlane({0.0f,  0.00f, 0.0f}, {2.0f * ARENA, 2.0f * ARENA}, grass);
+    for (float g = -ARENA; g <= ARENA + 0.001f; g += 0.5f) {
+        DrawLine3D({g, 0.01f, -ARENA}, {g, 0.01f, ARENA}, gridLine);
+        DrawLine3D({-ARENA, 0.01f, g}, {ARENA, 0.01f, g}, gridLine);
+    }
+ 
+    const float span = 2.0f * ARENA + 2.0f * WALL_T;
+    const float hy = WALL_H * 0.5f, off = ARENA + WALL_T * 0.5f;
+    const Vector3 centre[4] = {{0.0f, hy,  off}, {0.0f, hy, -off}, { off, hy, 0.0f}, {-off, hy, 0.0f}};
+    const Vector3 size[4]   = {{span, WALL_H, WALL_T}, {span, WALL_H, WALL_T},
+                               {WALL_T, WALL_H, 2.0f * ARENA}, {WALL_T, WALL_H, 2.0f * ARENA}};
+    for (int i = 0; i < 4; i++) {
+        DrawCube(centre[i], size[i].x, size[i].y, size[i].z, wall);
+        DrawCubeWires(centre[i], size[i].x, size[i].y, size[i].z, wallEdge);
+    }
+}
+ 
 int main() {
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(1100, 720, "Ragdoll Avatar Template");
@@ -418,17 +451,18 @@ int main() {
  
     float yaw = 0.6f, pitch = 0.25f, dist = 4.0f;
     float grabDist = 0.0f;
+    bool  draggingCam = false;              // left-drag that started on empty space
     Vector3 focus = {0.0f, 0.0f, 0.0f};     // camera follows the avatar on the ground plane
  
     while (!WindowShouldClose()) {
-        // ---- camera ----
-        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+        // ---- camera: drag on empty space (left) or hold right mouse to turn ----
+        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || (draggingCam && IsMouseButtonDown(MOUSE_BUTTON_LEFT))) {
             Vector2 d = GetMouseDelta();
             yaw   -= d.x * 0.005f;
             pitch += d.y * 0.005f;
             pitch = Clamp(pitch, -0.1f, 1.45f);
         }
-        dist = Clamp(dist - GetMouseWheelMove() * 0.3f, 1.5f, 10.0f);
+        dist = Clamp(dist - GetMouseWheelMove() * 0.3f, 1.5f, 9.0f);
  
         focus.x = Lerp(focus.x, avatar.pos[PELVIS].x, 0.05f);
         focus.z = Lerp(focus.z, avatar.pos[PELVIS].z, 0.05f);
@@ -474,16 +508,21 @@ int main() {
                 if (avatar.mode != MODE_RAGDOLL) avatar.GoLimp(false);   // grabbing cancels a get-up too
                 avatar.grabbed = hit;
                 grabDist = best;
+            } else {
+                draggingCam = true;                                      // missed the avatar: turn the camera
             }
         }
         if (avatar.grabbed >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             Ray ray = GetMouseRay(GetMousePosition(), cam);
             Vector3 t = Vector3Add(ray.position, Vector3Scale(ray.direction, grabDist));
+            const float lim = ARENA - 0.07f * avatar.look.height;       // held joint can't go through walls
+            t.x = Clamp(t.x, -lim, lim);
+            t.z = Clamp(t.z, -lim, lim);
             t.y = std::max(t.y, 0.03f);
             avatar.prev[avatar.grabbed] = avatar.pos[avatar.grabbed];
             avatar.pos[avatar.grabbed]  = t;
         }
-        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) avatar.Release();
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) { avatar.Release(); draggingCam = false; }
  
         for (int i = 0; i < STEPS; i++) avatar.Step(DT);
  
@@ -491,12 +530,11 @@ int main() {
         BeginDrawing();
         ClearBackground({205, 220, 235, 255});
         BeginMode3D(cam);
-            DrawPlane({0.0f, 0.0f, 0.0f}, {40.0f, 40.0f}, {170, 180, 165, 255});
-            DrawGrid(80, 0.5f);
+            DrawArena();
             avatar.Draw();
         EndMode3D();
  
-        DrawText("SPACE knock over   R reset   LMB drag joint   RMB orbit   Wheel zoom", 12, 10, 18, DARKGRAY);
+        DrawText("SPACE knock over   R reset   drag avatar joint / drag empty space = turn camera   Wheel zoom", 12, 10, 18, DARKGRAY);
         DrawText("UP/DOWN height   LEFT/RIGHT build   K skin  H hair  C shirt  P pants", 12, 34, 18, DARKGRAY);
         const char* state = "STANDING";
         if (avatar.mode == MODE_GETUP) state = "GETTING UP";
