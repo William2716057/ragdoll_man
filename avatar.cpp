@@ -3,9 +3,15 @@
 // The avatar is a Verlet-physics skeleton (joints = particles, bones = distance
 // constraints). Every body part is drawn from basic shapes: spheres + capsules.
 //
+// Fall / get-up cycle:
+//   STANDING --(knocked down)--> RAGDOLL --(on the ground for 0.5 s)--> GETUP --> STANDING
+// During GETUP the body is driven through keyframes (crouch -> rise -> stand) with
+// 2-bone IK for the arms and legs, while the constraint solver keeps the bones
+// intact. It stands up wherever it fell, facing the direction it ends up facing.
+//
 // Controls
-//   SPACE        toggle standing pose <-> ragdoll
-//   R            reset to standing pose
+//   SPACE        knock the avatar over
+//   R            hard reset to standing at the origin
 //   Left mouse   grab / drag / throw a joint (auto-enables ragdoll)
 //   Right mouse  orbit camera      Wheel: zoom
 //   UP / DOWN    height            LEFT / RIGHT: build
@@ -28,6 +34,8 @@ enum Joint {
     JOINT_COUNT
 };
  
+enum Mode { MODE_STANDING, MODE_RAGDOLL, MODE_GETUP };
+ 
 struct Appearance {
     float height = 1.75f;   // metres
     float build  = 1.0f;    // width multiplier (0.7 slim .. 1.5 broad)
@@ -45,6 +53,61 @@ static const Color PANTS[]  = {{50,60,90,255},{60,60,60,255},{110,90,60,255},{40
 template <typename T, size_t N> constexpr int Count(const T (&)[N]) { return (int)N; }
  
 // ----------------------------------------------------------------------------
+// Keyframes for the stand-up animation (all lengths in units of body height)
+// ----------------------------------------------------------------------------
+struct PoseKey {
+    float pelvisY, pelvisZ;     // pelvis position (local frame, +Z = forward)
+    float lean;                 // torso pitch forward, degrees
+    float footX, footY, footZ;  // foot target (X mirrored, scaled by build)
+    float handX, handY, handZ;  // hand target (X mirrored, scaled by build)
+};
+ 
+static const PoseKey KEY_CROUCH = {0.20f, -0.08f, 65.0f, 0.06f, 0.04f, 0.05f, 0.13f, 0.03f, 0.30f};
+static const PoseKey KEY_RISE   = {0.38f, -0.02f, 25.0f, 0.06f, 0.04f, 0.03f, 0.12f, 0.45f, 0.18f};
+static const PoseKey KEY_STAND  = {0.515f, 0.00f,  0.0f, 0.06f, 0.04f, 0.00f, 0.145f, 0.52f, 0.03f};
+ 
+static PoseKey KeyLerp(const PoseKey& a, const PoseKey& b, float t) {
+    PoseKey r;
+    float* ra = &r.pelvisY; const float* pa = &a.pelvisY; const float* pb = &b.pelvisY;
+    for (int i = 0; i < 9; i++) ra[i] = pa[i] + (pb[i] - pa[i]) * t;
+    return r;
+}
+static float Smooth(float t) { t = Clamp(t, 0.0f, 1.0f); return t * t * (3.0f - 2.0f * t); }
+ 
+// Timing (seconds)
+static const float FALL_WAIT      = 0.5f;   // time on the ground before getting up
+static const float GETUP_CROUCH   = 0.8f;   // tuck + hands down
+static const float GETUP_RISE_END = 1.4f;   // crouch -> rise
+static const float GETUP_STAND_END= 2.0f;   // rise -> stand
+static const float GETUP_TOTAL    = 2.2f;   // incl. settling time
+static const float GETUP_GAIN     = 0.15f;  // how strongly joints are pulled to the animation per step
+ 
+static PoseKey GetUpKey(float t) {
+    if (t < GETUP_CROUCH)    return KEY_CROUCH;
+    if (t < GETUP_RISE_END)  return KeyLerp(KEY_CROUCH, KEY_RISE,  Smooth((t - GETUP_CROUCH)   / (GETUP_RISE_END  - GETUP_CROUCH)));
+    if (t < GETUP_STAND_END) return KeyLerp(KEY_RISE,   KEY_STAND, Smooth((t - GETUP_RISE_END) / (GETUP_STAND_END - GETUP_RISE_END)));
+    return KEY_STAND;
+}
+ 
+// Two-bone IK: returns the middle joint (knee/elbow) for a chain a -> c.
+// If c is out of reach it is pulled in (passed by reference).
+static Vector3 TwoBone(Vector3 a, Vector3& c, float l1, float l2, Vector3 bend) {
+    Vector3 d = Vector3Subtract(c, a);
+    float dist = Vector3Length(d);
+    Vector3 dir;
+    if (dist < 1e-5f) { dir = {0.0f, -1.0f, 0.0f}; dist = 0.02f; c = Vector3Add(a, Vector3Scale(dir, dist)); }
+    else dir = Vector3Scale(d, 1.0f / dist);
+    float maxR = (l1 + l2) * 0.9999f;
+    if (dist > maxR) { dist = maxR; c = Vector3Add(a, Vector3Scale(dir, dist)); }
+    float x = (l1 * l1 - l2 * l2 + dist * dist) / (2.0f * dist);
+    float h = std::sqrt(std::max(l1 * l1 - x * x, 0.0f));
+    Vector3 p = Vector3Subtract(bend, Vector3Scale(dir, Vector3DotProduct(bend, dir)));
+    float pl = Vector3Length(p);
+    if (pl > 1e-5f) p = Vector3Scale(p, 1.0f / pl); else p = {1.0f, 0.0f, 0.0f};
+    return Vector3Add(a, Vector3Add(Vector3Scale(dir, x), Vector3Scale(p, h)));
+}
+ 
+// ----------------------------------------------------------------------------
 // Ragdoll
 // ----------------------------------------------------------------------------
 static const int   STEPS = 2;           // physics sub-steps per frame
@@ -59,11 +122,17 @@ struct Ragdoll {
     Vector3 pos[JOINT_COUNT];
     Vector3 prev[JOINT_COUNT];
     std::vector<Stick> sticks;
-    bool limp = false;
-    int  grabbed = -1;
  
-    bool  Pinned(int i) const { return !limp || i == grabbed; }
+    Mode  mode = MODE_STANDING;
+    int   grabbed = -1;
+    float groundTimer = 0.0f;   // how long the avatar has been down
+    float getupT = 0.0f;        // animation clock
+    Vector3 origin = {0.0f, 0.0f, 0.0f};   // where the avatar stands (XZ)
+    float yaw = 0.0f;                      // which way it faces when standing
+ 
+    bool  Pinned(int i) const { return mode == MODE_STANDING || i == grabbed; }
     float Radius(int j) const { return (j == HEAD ? 0.065f : 0.03f) * look.height; }
+    float Bone(int a, int b) const { return Vector3Distance(rest[a], rest[b]); }
  
     // Add a distance constraint. loFrac/hiFrac are fractions of the rest length.
     void Link(int a, int b, float loFrac = 1.0f, float hiFrac = 1.0f) {
@@ -117,14 +186,94 @@ struct Ragdoll {
         Stand();
     }
  
-    void Stand() {
-        limp = false; grabbed = -1;
-        for (int i = 0; i < JOINT_COUNT; i++) pos[i] = prev[i] = rest[i];
+    // Generate a full-body pose from a keyframe (IK for the limbs), placed at
+    // `org` (XZ) and rotated by `yw` about the Y axis.
+    void ComputePose(const PoseKey& k, Vector3 org, float yw, Vector3 out[JOINT_COUNT]) const {
+        const float H = look.height, b = look.build;
+        const float cl = std::cos(k.lean * DEG2RAD), sl = std::sin(k.lean * DEG2RAD);
+        const float cy = std::cos(yw), sy = std::sin(yw);
+        Vector3 loc[JOINT_COUNT];
+ 
+        // Torso + hips move as one rigid block, pitched about the pelvis
+        Vector3 pel = {0.0f, k.pelvisY * H, k.pelvisZ * H};
+        loc[PELVIS] = pel;
+        for (int j : {HEAD, NECK, L_SHO, R_SHO, CHEST_F, L_HIP, R_HIP}) {
+            Vector3 o = Vector3Subtract(rest[j], rest[PELVIS]);
+            loc[j] = {pel.x + o.x,
+                      pel.y + o.y * cl - o.z * sl,
+                      pel.z + o.z * cl + o.y * sl};
+        }
+ 
+        // Feet and hands are targets; knees and elbows come from IK
+        loc[L_FOOT] = {+k.footX * b * H, k.footY * H, k.footZ * H};
+        loc[R_FOOT] = {-k.footX * b * H, k.footY * H, k.footZ * H};
+        loc[L_HAND] = {+k.handX * b * H, k.handY * H, k.handZ * H};
+        loc[R_HAND] = {-k.handX * b * H, k.handY * H, k.handZ * H};
+ 
+        const Vector3 fwd = {0.0f, 0.0f, 1.0f}, back = {0.0f, 0.0f, -1.0f};
+        loc[L_KNEE] = TwoBone(loc[L_HIP], loc[L_FOOT], Bone(L_HIP, L_KNEE), Bone(L_KNEE, L_FOOT), fwd);
+        loc[R_KNEE] = TwoBone(loc[R_HIP], loc[R_FOOT], Bone(R_HIP, R_KNEE), Bone(R_KNEE, R_FOOT), fwd);
+        loc[L_ELB]  = TwoBone(loc[L_SHO], loc[L_HAND], Bone(L_SHO, L_ELB),  Bone(L_ELB, L_HAND),  back);
+        loc[R_ELB]  = TwoBone(loc[R_SHO], loc[R_HAND], Bone(R_SHO, R_ELB),  Bone(R_ELB, R_HAND),  back);
+ 
+        for (int j = 0; j < JOINT_COUNT; j++) {
+            out[j] = {org.x + loc[j].x * cy + loc[j].z * sy,
+                      loc[j].y,
+                      org.z - loc[j].x * sy + loc[j].z * cy};
+        }
     }
  
-    void GoLimp() {
+    // Snap to the standing pose at the current origin/yaw
+    void Stand() {
+        mode = MODE_STANDING; grabbed = -1; groundTimer = 0.0f; getupT = 0.0f;
+        ComputePose(KEY_STAND, origin, yaw, pos);
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
-        limp = true;
+    }
+ 
+    void HardReset() { origin = {0.0f, 0.0f, 0.0f}; yaw = 0.0f; Stand(); }
+ 
+    // Switch to physics. `push` gives the upper body a shove so it topples.
+    void GoLimp(bool push) {
+        for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
+        mode = MODE_RAGDOLL; groundTimer = 0.0f; getupT = 0.0f;
+        if (push) {
+            float a = (float)GetRandomValue(0, 628) / 100.0f;
+            Vector3 dir = {std::sin(a), 0.0f, std::cos(a)};
+            for (int j : {HEAD, NECK, L_SHO, R_SHO, CHEST_F})
+                prev[j] = Vector3Subtract(pos[j], Vector3Scale(dir, 0.012f));
+        }
+    }
+ 
+    void BodyFrame(Vector3& up, Vector3& fwd) const {
+        up  = Vector3Normalize(Vector3Subtract(pos[NECK], pos[PELVIS]));
+        fwd = Vector3Subtract(pos[CHEST_F], Vector3Lerp(pos[NECK], pos[PELVIS], 0.4f));
+        fwd = Vector3Normalize(Vector3Subtract(fwd, Vector3Scale(up, Vector3DotProduct(fwd, up))));
+    }
+ 
+    // Decide where/which way to stand up, then start the animation
+    void BeginGetUp() {
+        Vector3 up, fwd;
+        BodyFrame(up, fwd);
+        origin = {pos[PELVIS].x, 0.0f, pos[PELVIS].z};
+ 
+        float fl = std::sqrt(fwd.x * fwd.x + fwd.z * fwd.z);
+        float fx, fz;
+        if (fl > 0.5f) {                       // lying on a side / sitting: face where the chest faces
+            fx = fwd.x / fl; fz = fwd.z / fl;
+        } else {                               // lying on back/front: use the head direction
+            float hx = up.x, hz = up.z;
+            float hl = std::sqrt(hx * hx + hz * hz);
+            if (hl < 1e-4f) { hx = fwd.x; hz = fwd.z; hl = std::max(std::sqrt(hx * hx + hz * hz), 1e-4f); }
+            hx /= hl; hz /= hl;
+            if (fwd.y > 0.0f) { fx = -hx; fz = -hz; }   // on back: sit up facing the feet
+            else              { fx =  hx; fz =  hz; }   // on front: rise facing where the head points
+        }
+        yaw = std::atan2(fx, fz);
+        mode = MODE_GETUP;
+        getupT = 0.0f;
+        groundTimer = 0.0f;
+        grabbed = -1;
+        for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
  
     void SolveSticks() {
@@ -144,8 +293,14 @@ struct Ragdoll {
         }
     }
  
-    void Step(float dt) {
-        if (!limp) return;
+    void FloorClamp() {
+        for (int i = 0; i < JOINT_COUNT; i++) {
+            if (Pinned(i)) continue;
+            pos[i].y = std::max(pos[i].y, Radius(i));
+        }
+    }
+ 
+    void StepRagdoll(float dt) {
         const Vector3 g = {0.0f, -9.81f, 0.0f};
         for (int i = 0; i < JOINT_COUNT; i++) {
             if (Pinned(i)) continue;
@@ -153,19 +308,35 @@ struct Ragdoll {
             prev[i] = pos[i];
             pos[i] = Vector3Add(Vector3Add(pos[i], vel), Vector3Scale(g, dt * dt));
         }
-        for (int it = 0; it < ITERS; it++) {
-            SolveSticks();
-            for (int i = 0; i < JOINT_COUNT; i++) {          // floor
-                if (Pinned(i)) continue;
-                pos[i].y = std::max(pos[i].y, Radius(i));
-            }
-        }
+        for (int it = 0; it < ITERS; it++) { SolveSticks(); FloorClamp(); }
         for (int i = 0; i < JOINT_COUNT; i++) {              // friction (once per step)
             if (Pinned(i) || pos[i].y > Radius(i) + 1e-4f) continue;
             prev[i].x += (pos[i].x - prev[i].x) * 0.30f;
             prev[i].z += (pos[i].z - prev[i].z) * 0.30f;
             prev[i].y = pos[i].y;
         }
+ 
+        // Fall detection: pelvis near the floor and nobody holding the avatar
+        if (grabbed < 0 && pos[PELVIS].y < 0.20f * look.height) groundTimer += dt;
+        else groundTimer = 0.0f;
+        if (groundTimer >= FALL_WAIT) BeginGetUp();
+    }
+ 
+    void StepGetUp(float dt) {
+        getupT += dt;
+        Vector3 target[JOINT_COUNT];
+        ComputePose(GetUpKey(getupT), origin, yaw, target);
+        for (int i = 0; i < JOINT_COUNT; i++) {              // pull joints toward the animation
+            pos[i] = Vector3Add(pos[i], Vector3Scale(Vector3Subtract(target[i], pos[i]), GETUP_GAIN));
+            prev[i] = pos[i];
+        }
+        for (int it = 0; it < ITERS; it++) { SolveSticks(); FloorClamp(); }
+        if (getupT >= GETUP_TOTAL) Stand();                  // seamless: same pose as the last key
+    }
+ 
+    void Step(float dt) {
+        if (mode == MODE_RAGDOLL) StepRagdoll(dt);
+        else if (mode == MODE_GETUP) StepGetUp(dt);
     }
  
     void Release() {
@@ -185,9 +356,8 @@ struct Ragdoll {
  
         // Body frame from the torso
         Vector3 shoMid = Vector3Lerp(pos[L_SHO], pos[R_SHO], 0.5f);
-        Vector3 up  = Vector3Normalize(Vector3Subtract(pos[NECK], pos[PELVIS]));
-        Vector3 fwd = Vector3Subtract(pos[CHEST_F], Vector3Lerp(pos[NECK], pos[PELVIS], 0.4f));
-        fwd = Vector3Normalize(Vector3Subtract(fwd, Vector3Scale(up, Vector3DotProduct(fwd, up))));
+        Vector3 up, fwd;
+        BodyFrame(up, fwd);
         Vector3 right = Vector3CrossProduct(fwd, up);
  
         // Torso + pants waist
@@ -248,6 +418,7 @@ int main() {
  
     float yaw = 0.6f, pitch = 0.25f, dist = 4.0f;
     float grabDist = 0.0f;
+    Vector3 focus = {0.0f, 0.0f, 0.0f};     // camera follows the avatar on the ground plane
  
     while (!WindowShouldClose()) {
         // ---- camera ----
@@ -259,8 +430,11 @@ int main() {
         }
         dist = Clamp(dist - GetMouseWheelMove() * 0.3f, 1.5f, 10.0f);
  
+        focus.x = Lerp(focus.x, avatar.pos[PELVIS].x, 0.05f);
+        focus.z = Lerp(focus.z, avatar.pos[PELVIS].z, 0.05f);
+ 
         Camera3D cam = {};
-        Vector3 target = {0.0f, 0.55f * avatar.look.height, 0.0f};
+        Vector3 target = {focus.x, 0.55f * avatar.look.height, focus.z};
         cam.target = target;
         cam.position = {target.x + dist * std::cos(pitch) * std::sin(yaw),
                         target.y + dist * std::sin(pitch),
@@ -269,7 +443,7 @@ int main() {
         cam.fovy = 45.0f;
         cam.projection = CAMERA_PERSPECTIVE;
  
-        // ---- template editing (rebuilds the skeleton) ----
+        // ---- template editing (rebuilds the skeleton, keeps position) ----
         bool rebuild = false;
         if (IsKeyPressed(KEY_UP))    { look.height = Clamp(look.height + 0.05f, 1.20f, 2.10f); rebuild = true; }
         if (IsKeyPressed(KEY_DOWN))  { look.height = Clamp(look.height - 0.05f, 1.20f, 2.10f); rebuild = true; }
@@ -285,8 +459,8 @@ int main() {
         if (rebuild) avatar.Build(look);
  
         // ---- pose / physics control ----
-        if (IsKeyPressed(KEY_R)) avatar.Stand();
-        if (IsKeyPressed(KEY_SPACE)) { if (avatar.limp) avatar.Stand(); else avatar.GoLimp(); }
+        if (IsKeyPressed(KEY_R)) avatar.HardReset();
+        if (IsKeyPressed(KEY_SPACE) && avatar.mode == MODE_STANDING) avatar.GoLimp(true);   // knock over
  
         // ---- mouse grab ----
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -297,7 +471,7 @@ int main() {
                 if (c.hit && c.distance < best) { best = c.distance; hit = i; }
             }
             if (hit >= 0) {
-                if (!avatar.limp) avatar.GoLimp();
+                if (avatar.mode != MODE_RAGDOLL) avatar.GoLimp(false);   // grabbing cancels a get-up too
                 avatar.grabbed = hit;
                 grabDist = best;
             }
@@ -317,15 +491,19 @@ int main() {
         BeginDrawing();
         ClearBackground({205, 220, 235, 255});
         BeginMode3D(cam);
-            DrawPlane({0.0f, 0.0f, 0.0f}, {12.0f, 12.0f}, {170, 180, 165, 255});
-            DrawGrid(24, 0.5f);
+            DrawPlane({0.0f, 0.0f, 0.0f}, {40.0f, 40.0f}, {170, 180, 165, 255});
+            DrawGrid(80, 0.5f);
             avatar.Draw();
         EndMode3D();
  
-        DrawText("SPACE ragdoll/stand   R reset   LMB drag joint   RMB orbit   Wheel zoom", 12, 10, 18, DARKGRAY);
+        DrawText("SPACE knock over   R reset   LMB drag joint   RMB orbit   Wheel zoom", 12, 10, 18, DARKGRAY);
         DrawText("UP/DOWN height   LEFT/RIGHT build   K skin  H hair  C shirt  P pants", 12, 34, 18, DARKGRAY);
-        DrawText(TextFormat("height %.2f m   build %.1f   %s", look.height, look.build,
-                            avatar.limp ? "RAGDOLL" : "STANDING"), 12, 58, 18, DARKGRAY);
+        const char* state = "STANDING";
+        if (avatar.mode == MODE_GETUP) state = "GETTING UP";
+        else if (avatar.mode == MODE_RAGDOLL)
+            state = avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
+                                              : "RAGDOLL";
+        DrawText(TextFormat("height %.2f m   build %.1f   %s", look.height, look.build, state), 12, 58, 18, DARKGRAY);
         EndDrawing();
     }
     CloseWindow();
