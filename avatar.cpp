@@ -16,8 +16,10 @@
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
 //   Bed (corner): carry the avatar onto the bed and let go. Lying still for 1 s = asleep.
 //                sleepiness refills while asleep; at 100 it wakes and stands up beside the bed.
-//   Mood > 60: he dances for 2.5 s at random intervals.  Mood < 25: he cries (hands over his face).
-//   M / N        test shortcuts: set mood to 15 (sad) / 100 (happy)
+//   Mood > 60: he dances for 2.5 s at random intervals.
+//   Mood < 10: he cries continuously (hands over his face).
+//   Mood 10-25: he cries for 1 s, once at a random moment in every 7 s.
+//   B / M / N    test shortcuts: set mood to 5 (miserable) / 15 (sad) / 100 (happy)
 //   Z            make him sleepy right now (sets sleepiness to the go-to-bed level)
 //   Below 25 sleepiness a standing avatar walks to the bed, sits on the edge, lies down and sleeps.
 //   UP / DOWN    height            LEFT / RIGHT: build
@@ -149,7 +151,10 @@ static const float MOOD_REGEN_INTERVAL = 2.0f;   // mood recovers 1 point every 
  
 // Emotes (standing only)
 static const float MOOD_DANCE_ABOVE = 60.0f;    // above this he dances now and then
-static const float MOOD_CRY_BELOW   = 25.0f;    // below this he covers his face and cries
+static const float MOOD_CRY_BELOW   = 25.0f;    // below this he starts crying (a brief gesture now and then)...
+static const float MOOD_CRY_CONT    = 10.0f;    // ...and below this he cries continuously
+static const float CRY_BURST_TIME   = 1.0f;     // length of the occasional cry gesture
+static const float CRY_WINDOW       = 7.0f;     // one gesture at a random moment in every window of this length
 static const float DANCE_TIME       = 2.5f;     // seconds per dance
  
 // Going to bed: below this sleepiness the avatar walks to the bed by itself
@@ -221,6 +226,10 @@ struct Ragdoll {
     float cryBlend    = 0.0f;                  // 0..1 ease in/out of hands-on-face
     float emoteClock  = 0.0f;
     float nextDanceIn = 5.0f;                  // random countdown to the next dance
+    float cryWindowT  = 0.0f;                  // position inside the current 7 s window (mood 10-25)
+    float cryStartAt  = 2.0f;                  // when in the window the gesture starts
+    float cryBurstT   = 0.0f;                  // seconds of the current cry gesture left
+    bool  cryBurstDone = false;                // already cried this window
     bool  asleep   = false;
  
     bool  Pinned(int i) const { return mode == MODE_STANDING || mode == MODE_WALK || mode == MODE_BEDANIM || i == grabbed; }
@@ -348,7 +357,7 @@ struct Ragdoll {
     void Stand() {
         mode = MODE_STANDING; grabbed = -1; groundTimer = 0.0f; getupT = 0.0f;
         bedTimer = 0.0f; asleep = false; walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f; bedT = 0.0f; bedReverse = false;
-        danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
+        danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; cryWindowT = 0.0f; cryBurstT = 0.0f; cryBurstDone = false; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
         ComputePose(KEY_STAND, origin, yaw, pos);
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
@@ -611,10 +620,28 @@ struct Ragdoll {
             if (nextDanceIn <= 0.0f) { danceT = DANCE_TIME; danceClock = 0.0f; }
         }
         if (danceT > 0.0f || danceBlend > 0.0f) danceClock += dt;
+ 
+        // Crying: continuous below MOOD_CRY_CONT; between that and MOOD_CRY_BELOW only a 1 s gesture,
+        // once at a random moment in every 7 s window.
+        const bool sad = moodLevel < MOOD_CRY_BELOW, weeping = moodLevel < MOOD_CRY_CONT;
+        if (sad && !weeping && !calm) {
+            cryWindowT += dt;
+            if (!cryBurstDone && cryWindowT >= cryStartAt) { cryBurstT = CRY_BURST_TIME; cryBurstDone = true; }
+            if (cryWindowT >= CRY_WINDOW) {                         // new window, new random moment (0..6 s in)
+                cryWindowT -= CRY_WINDOW;
+                cryStartAt = (float)GetRandomValue(0, 60) / 10.0f;
+                cryBurstDone = false;
+            }
+        } else if (!sad) {                                          // cheered up: reset the schedule
+            cryWindowT = 0.0f; cryBurstDone = false;
+            cryStartAt = (float)GetRandomValue(0, 60) / 10.0f;
+        }
+        if (cryBurstT > 0.0f) cryBurstT = std::max(0.0f, cryBurstT - dt);
+ 
         const float dTarget = danceT > 0.0f ? 1.0f : 0.0f;
-        const float cTarget = (!calm && moodLevel < MOOD_CRY_BELOW) ? 1.0f : 0.0f;
+        const float cTarget = (!calm && ((sad && weeping) || (sad && cryBurstT > 0.0f))) ? 1.0f : 0.0f;
         danceBlend += Clamp(dTarget - danceBlend, -6.0f * dt, 6.0f * dt);
-        cryBlend   += Clamp(cTarget - cryBlend,   -2.5f * dt, 2.5f * dt);
+        cryBlend   += Clamp(cTarget - cryBlend,   -5.0f * dt, 5.0f * dt);
     }
  
     // Layer the current emotes onto a key/tweak; returns an extra yaw (the dance shimmy).
@@ -861,8 +888,9 @@ int main() {
         // ---- pose / physics control ----
         if (IsKeyPressed(KEY_R)) avatar.HardReset();
         if (IsKeyPressed(KEY_SPACE) && (avatar.mode == MODE_STANDING || avatar.mode == MODE_WALK)) avatar.GoLimp(true);   // knock over
-        if (IsKeyPressed(KEY_M)) mood = 15.0f;                                     // test shortcuts: sad ...
-        if (IsKeyPressed(KEY_N)) mood = 100.0f;                                    // ... and happy
+        if (IsKeyPressed(KEY_B)) mood = 5.0f;                                      // test shortcuts: miserable (continuous crying) ...
+        if (IsKeyPressed(KEY_M)) mood = 15.0f;                                     // ... sad (occasional 1 s cry) ...
+        if (IsKeyPressed(KEY_N)) mood = 100.0f;                                    // ... and happy (dances)
         if (IsKeyPressed(KEY_Z)) sleepiness = std::min(sleepiness, SLEEPY_AT);     // test shortcut: make him sleepy now
  
         // ---- mouse grab ----
