@@ -14,6 +14,9 @@
 //   R            hard reset to standing at the origin
 //   Left mouse   grab / drag / throw a joint (auto-enables ragdoll)
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
+//   [Drop food] button (top of the screen): a pink disk drops onto a random spot of the grass. A standing avatar
+//                walks to it, crouches, picks it up, holds it to his mouth for 1 s, and it disappears.
+//   Height keys (UP/DOWN) are switched off for now (HEIGHT_KEYS).
 //   Bed (corner): carry the avatar onto the bed and let go. Lying still for 1 s = asleep.
 //                sleepiness refills while asleep; at 100 it wakes and stands up beside the bed.
 //   Mood > 60: he dances for 2.5 s at random intervals.
@@ -22,7 +25,7 @@
 //   B / M / N    test shortcuts: set mood to 5 (miserable) / 15 (sad) / 100 (happy)
 //   Z            make him sleepy right now (sets sleepiness to the go-to-bed level)
 //   Below 25 sleepiness a standing avatar walks to the bed, sits on the edge, lies down and sleeps.
-//   UP / DOWN    height            LEFT / RIGHT: build
+//   LEFT / RIGHT build
 //   K / H / C / P  cycle skin / hair / shirt / pants colours
  
 #include "raylib.h"
@@ -42,7 +45,7 @@ enum Joint {
     JOINT_COUNT
 };
  
-enum Mode { MODE_STANDING, MODE_RAGDOLL, MODE_GETUP, MODE_WALK, MODE_BEDANIM };
+enum Mode { MODE_STANDING, MODE_RAGDOLL, MODE_GETUP, MODE_WALK, MODE_BEDANIM, MODE_FETCH, MODE_EAT };
  
 struct Appearance {
     float height = 1.75f;   // metres
@@ -73,6 +76,9 @@ struct PoseKey {
 static const PoseKey KEY_CROUCH = {0.20f, -0.08f, 65.0f, 0.06f, 0.04f, 0.05f, 0.13f, 0.03f, 0.30f};
 static const PoseKey KEY_RISE   = {0.38f, -0.02f, 25.0f, 0.06f, 0.04f, 0.03f, 0.12f, 0.45f, 0.18f};
 static const PoseKey KEY_STAND  = {0.515f, 0.00f,  0.0f, 0.06f, 0.04f, 0.00f, 0.145f, 0.52f, 0.03f};
+// Eating: deep crouch to pick a disk off the floor (right hand is steered separately), then upright with a slight bow
+static const PoseKey KEY_PICK   = {0.170f, -0.10f, 66.0f, 0.07f, 0.04f, 0.02f, 0.145f, 0.12f, 0.15f};
+static const PoseKey KEY_MOUTH  = {0.515f, 0.00f,  6.0f, 0.06f, 0.04f, 0.00f, 0.145f, 0.52f, 0.03f};
  
 static PoseKey KeyLerp(const PoseKey& a, const PoseKey& b, float t) {
     PoseKey r;
@@ -88,6 +94,10 @@ struct PoseTweak {
     Vector3 lHand = {0, 0, 0}, rHand = {0, 0, 0};   // added to the hand targets
     Vector3 lFoot = {0, 0, 0}, rFoot = {0, 0, 0};   // added to the foot targets
     float   coverFace = 0.0f;                    // 0..1: bring both hands up over the eyes
+    Vector3 rHandAt = {0, 0, 0};                 // absolute local target (body heights) for the right hand...
+    float   rHandAtW  = 0.0f;                    // ...and how strongly it is pulled there (0..1)
+    float   rToMouth  = 0.0f;                    // 0..1: then pulled on up to the mouth
+    float   rBendDown = 0.0f;                    // 0..1: right elbow points out/down instead of back
 };
  
 // Timing (seconds)
@@ -171,6 +181,28 @@ static float WrapPi(float a) {
     return a;
 }
  
+// Does the straight walk a -> b (ground plane) cut through the bed (plus a margin)?
+static bool SegmentHitsBed(Vector3 a, Vector3 b, float margin) {
+    float t0 = 0.0f, t1 = 1.0f;
+    const float dx = b.x - a.x, dz = b.z - a.z;
+    auto slab = [&](float p0, float d, float lo, float hi) {
+        if (std::fabs(d) < 1e-6f) return p0 >= lo && p0 <= hi;
+        float ta = (lo - p0) / d, tb = (hi - p0) / d;
+        if (ta > tb) std::swap(ta, tb);
+        t0 = std::max(t0, ta); t1 = std::min(t1, tb);
+        return t0 <= t1;
+    };
+    return slab(a.x, dx, BED.min.x - margin, BED.max.x + margin) &&
+           slab(a.z, dz, BED.min.z - margin, BED.max.z + margin);
+}
+ 
+// Food: a small pink disk dropped from above. Drawn the size of his hand.
+enum FoodState { FOOD_FALLING, FOOD_LANDED, FOOD_TARGETED };
+struct Food { Vector3 pos; float vy; int state; };      // pos = centre of the disk
+ 
+static const float FETCH_STOP = 0.34f;      // how far from the food he stops before crouching (m)
+static const bool  HEIGHT_KEYS = false;     // the height keys are switched off for now
+ 
 static bool OverBed(Vector3 p) { return p.x > BED.min.x && p.x < BED.max.x && p.z > BED.min.z && p.z < BED.max.z; }
  
 // Push a sphere (centre p, radius r) out of a box along the axis of least penetration.
@@ -218,6 +250,15 @@ struct Ragdoll {
     float wakeBlend = 0.0f;                // 0..1: eases from wherever he was lying into the animation
     Vector3 wakeStart[JOINT_COUNT];
  
+    // Food fetching / eating
+    Vector3 foodGoal = {0, 0, 0};              // world position of the food he is walking to
+    int     fetchStage = 0;                    // 0 = pick route, 1 = via the bed's corner, 2 = to the food
+    float   eatT = 0.0f;                       // clock of the crouch / pick up / eat animation
+    Vector3 eatFoodLocal = {0, 0, 0};          // food position in his own frame (body heights)
+    bool    foodHeld = false;                  // true while the disk is in his hand
+    Vector3 foodPos = {0, 0, 0};               // where the held disk is (read by the game loop)
+    bool    foodEaten = false;                 // set when the disk has been eaten (game loop clears it)
+ 
     // Emotes (set moodLevel from the game loop each frame)
     float moodLevel   = 100.0f;
     float danceT      = 0.0f;                  // seconds of the current dance left (0 = not dancing)
@@ -232,7 +273,7 @@ struct Ragdoll {
     bool  cryBurstDone = false;                // already cried this window
     bool  asleep   = false;
  
-    bool  Pinned(int i) const { return mode == MODE_STANDING || mode == MODE_WALK || mode == MODE_BEDANIM || i == grabbed; }
+    bool  Pinned(int i) const { return mode == MODE_STANDING || mode == MODE_WALK || mode == MODE_BEDANIM || mode == MODE_FETCH || mode == MODE_EAT || i == grabbed; }
     float Radius(int j) const { return (j == HEAD ? 0.065f : 0.03f) * look.height; }
     float Bone(int a, int b) const { return Vector3Distance(rest[a], rest[b]); }
  
@@ -340,6 +381,15 @@ struct Ragdoll {
                 bendL = Vector3Lerp(back, {+0.4f, -1.0f, 0.1f}, c);
                 bendR = Vector3Lerp(back, {-0.4f, -1.0f, 0.1f}, c);
             }
+            if (tw->rHandAtW > 0.0f)                      // reach for something (the food)
+                loc[R_HAND] = Vector3Lerp(loc[R_HAND], Vector3Scale(tw->rHandAt, H), tw->rHandAtW);
+            if (tw->rToMouth > 0.0f) {                    // bring it up to the mouth
+                const Vector3 faceDir = {0.0f, -sl, cl};
+                Vector3 mouth = Vector3Add(loc[HEAD], Vector3Scale(faceDir, 0.093f * H));
+                mouth.y -= 0.03f * H;
+                loc[R_HAND] = Vector3Lerp(loc[R_HAND], mouth, tw->rToMouth);
+            }
+            if (tw->rBendDown > 0.0f) bendR = Vector3Lerp(bendR, {-0.4f, -1.0f, 0.1f}, tw->rBendDown);
         }
         loc[L_KNEE] = TwoBone(loc[L_HIP], loc[L_FOOT], Bone(L_HIP, L_KNEE), Bone(L_KNEE, L_FOOT), fwd);
         loc[R_KNEE] = TwoBone(loc[R_HIP], loc[R_FOOT], Bone(R_HIP, R_KNEE), Bone(R_KNEE, R_FOOT), fwd);
@@ -357,7 +407,7 @@ struct Ragdoll {
     void Stand() {
         mode = MODE_STANDING; grabbed = -1; groundTimer = 0.0f; getupT = 0.0f;
         bedTimer = 0.0f; asleep = false; walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f; bedT = 0.0f; bedReverse = false;
-        danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; cryWindowT = 0.0f; cryBurstT = 0.0f; cryBurstDone = false; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
+        foodHeld = false; danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; cryWindowT = 0.0f; cryBurstT = 0.0f; cryBurstDone = false; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
         ComputePose(KEY_STAND, origin, yaw, pos);
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
@@ -547,7 +597,17 @@ struct Ragdoll {
         }
         if (arrived && walkStage == 1) { walkStage = 2; arrived = false; }
  
-        // gait: full stride while moving, small shuffle while turning, fade out when done
+        ApplyWalkPose(dt, moving, arrived, arrived && walkStage == 2);   // keeps crying on the way, settles at the bedside
+ 
+        if (arrived && walkStage == 2 && std::fabs(WrapPi(PI * 0.5f - yaw)) < 0.05f && gaitAmp < 0.05f && cryBlend < 0.01f) {
+            origin = BedsideSpot(); yaw = PI * 0.5f;
+            mode = MODE_BEDANIM; bedT = 0.0f; bedReverse = false;
+        }
+    }
+ 
+    // Shared walking pose: stride while moving, a little shuffle while turning, fading out when done.
+    // `settle` calms any crying so the hands are free for what comes next.
+    void ApplyWalkPose(float dt, bool moving, bool arrived, bool settle) {
         float targetAmp = moving ? 1.0f : (arrived ? 0.0f : 0.5f);
         gaitAmp += Clamp(targetAmp - gaitAmp, -4.0f * dt, 4.0f * dt);
         gaitPhase += (moving ? 5.5f : 2.5f) * dt;
@@ -555,16 +615,100 @@ struct Ragdoll {
         PoseKey k = KEY_STAND;
         k.pelvisY = 0.515f - 0.022f * gaitAmp - 0.010f * gaitAmp * std::fabs(std::sin(gaitPhase));   // knees soften, body bobs
         k.lean = 4.0f * gaitAmp;
-        k.lean += 6.0f * cryBlend;
-        UpdateEmotes(dt, false, arrived && walkStage == 2);   // keeps crying on the way, settles at the bedside
-        PoseTweak tw; tw.coverFace = cryBlend;
+        UpdateEmotes(dt, false, settle);
+        PoseTweak tw;
+        ApplyEmotes(k, tw);                                  // same crying pose as when standing (no dancing on the move)
         ComputePose(k, origin, yaw, pos, gaitPhase, gaitAmp, &tw);
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
+    }
  
-        if (arrived && walkStage == 2 && std::fabs(WrapPi(PI * 0.5f - yaw)) < 0.05f && gaitAmp < 0.05f && cryBlend < 0.01f) {
-            origin = BedsideSpot(); yaw = PI * 0.5f;
-            mode = MODE_BEDANIM; bedT = 0.0f; bedReverse = false;
+    // ------------------------------------------------------------------------
+    // Food: walk to the disk, crouch, pick it up, bring it to the mouth, eat
+    // ------------------------------------------------------------------------
+    void StartFetch(Vector3 food) {
+        mode = MODE_FETCH; grabbed = -1;
+        foodGoal = food; fetchStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f;
+        foodHeld = false; foodEaten = false;
+        danceT = 0.0f; danceBlend = 0.0f;
+    }
+ 
+    void StepFetch(float dt) {
+        if (fetchStage == 0)   // go round the bed if it is in the way
+            fetchStage = SegmentHitsBed(origin, foodGoal, 0.4f) ? 1 : 2;
+ 
+        const bool toFood = (fetchStage == 2);
+        const Vector3 goal = toFood ? foodGoal : CornerSpot();
+        const float dx = goal.x - origin.x, dz = goal.z - origin.z;
+        const float dist = std::sqrt(dx * dx + dz * dz);
+        const float remaining = toFood ? dist - FETCH_STOP : dist - 0.05f;   // how much further to walk
+        if (!toFood && remaining <= 0.003f) { fetchStage = 2; return; }     // reached the corner: now the food
+ 
+        const bool arrived = remaining <= 0.003f;
+        const float wantYaw = dist > 1e-4f ? std::atan2(dx, dz) : yaw;       // always face where he is going (the food, once there)
+        const float dyaw = WrapPi(wantYaw - yaw);
+        const float maxTurn = TURN_RATE * dt;
+        yaw += Clamp(dyaw, -maxTurn, maxTurn);
+ 
+        const bool moving = !arrived && std::fabs(dyaw) < 0.6f;
+        if (moving) {
+            float step = std::min(WALK_SPEED * dt, std::max(remaining, 0.0f));
+            origin.x += std::sin(yaw) * step;
+            origin.z += std::cos(yaw) * step;
         }
+        ApplyWalkPose(dt, moving, arrived, arrived && toFood);
+ 
+        if (toFood && arrived && std::fabs(dyaw) < 0.05f && gaitAmp < 0.05f && cryBlend < 0.01f) BeginEat();
+    }
+ 
+    void BeginEat() {
+        const float H = look.height, cy = std::cos(yaw), sy = std::sin(yaw);
+        const float dxw = foodGoal.x - origin.x, dzw = foodGoal.z - origin.z;
+        eatFoodLocal = {(dxw * cy - dzw * sy) / H, 0.03f, (dxw * sy + dzw * cy) / H};   // food in his own frame
+        eatT = 0.0f; foodHeld = false; foodEaten = false;
+        mode = MODE_EAT;
+    }
+ 
+    void StepEat(float dt) {
+        eatT += dt;
+        const float H = look.height;
+        const float tReach = 0.8f, tGrab = tReach + 0.25f, tLift = tGrab + 0.9f;
+        const float tChew = tLift + 1.0f;                // one second at the mouth, then the food is gone
+        const float tReturn = tChew + 0.5f;
+ 
+        PoseKey k = KEY_STAND;
+        PoseTweak tw;
+        if (eatT < tReach) {                             // crouch down, right hand reaching for the disk
+            float s = Smooth(eatT / tReach);
+            k = KeyLerp(KEY_STAND, KEY_PICK, s);
+            tw.rHandAt = eatFoodLocal; tw.rHandAtW = s;
+        } else if (eatT < tGrab) {                       // grab it
+            k = KEY_PICK;
+            tw.rHandAt = eatFoodLocal; tw.rHandAtW = 1.0f;
+        } else if (eatT < tLift) {                       // stand up, raise it to the mouth
+            float s = Smooth((eatT - tGrab) / (tLift - tGrab));
+            k = KeyLerp(KEY_PICK, KEY_MOUTH, s);
+            tw.rHandAt = eatFoodLocal; tw.rHandAtW = 1.0f; tw.rToMouth = s; tw.rBendDown = s;
+        } else if (eatT < tChew) {                       // eating
+            k = KEY_MOUTH;
+            k.lean += 1.5f * std::sin(2.0f * PI * 4.0f * (eatT - tLift));      // chewing
+            tw.rHandAtW = 1.0f; tw.rToMouth = 1.0f; tw.rBendDown = 1.0f;
+        } else {                                         // lower the hand again
+            float s = Smooth((eatT - tChew) / (tReturn - tChew));
+            k = KeyLerp(KEY_MOUTH, KEY_STAND, s);
+            tw.rToMouth = 1.0f - s; tw.rBendDown = 1.0f - s;
+        }
+        ComputePose(k, origin, yaw, pos, 0.0f, 0.0f, &tw);
+        for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
+ 
+        // The disk: lies on the floor until grabbed, then rides in his hand, then is gone
+        const float grabAt = tReach + 0.1f;
+        if (!foodEaten && eatT >= grabAt) {
+            const float rise = 0.037f * H * Smooth((eatT - grabAt) / 0.3f);    // lifts out from under the hand onto the palm
+            foodPos = {pos[R_HAND].x, pos[R_HAND].y + rise, pos[R_HAND].z};
+            foodHeld = true;
+        }
+        if (!foodEaten && eatT >= tChew) { foodEaten = true; foodHeld = false; }
+        if (eatT >= tReturn) Stand();
     }
  
     struct BedKey { PoseKey k; float x, z, yaw; };
@@ -641,7 +785,8 @@ struct Ragdoll {
         const float dTarget = danceT > 0.0f ? 1.0f : 0.0f;
         const float cTarget = (!calm && ((sad && weeping) || (sad && cryBurstT > 0.0f))) ? 1.0f : 0.0f;
         danceBlend += Clamp(dTarget - danceBlend, -6.0f * dt, 6.0f * dt);
-        cryBlend   += Clamp(cTarget - cryBlend,   -5.0f * dt, 5.0f * dt);
+        const float cryRate = calm ? 2.5f : 5.0f;            // lower the hands gently when settling to eat / lie down
+        cryBlend   += Clamp(cTarget - cryBlend,   -cryRate * dt, cryRate * dt);
     }
  
     // Layer the current emotes onto a key/tweak; returns an extra yaw (the dance shimmy).
@@ -684,6 +829,8 @@ struct Ragdoll {
         else if (mode == MODE_GETUP) StepGetUp(dt);
         else if (mode == MODE_WALK) StepWalk(dt);
         else if (mode == MODE_BEDANIM) StepBedAnim(dt);
+        else if (mode == MODE_FETCH) StepFetch(dt);
+        else if (mode == MODE_EAT) StepEat(dt);
     }
  
     void Release() {
@@ -821,6 +968,13 @@ static void DrawArena() {
     }
 }
  
+static void DrawFood(const Food& f, float H) {
+    const float r = 0.03f * H, th = 0.012f * H;            // a disk the size of his hand
+    const Vector3 base = {f.pos.x, f.pos.y - th * 0.5f, f.pos.z};
+    DrawCylinder(base, r, r, th, 28, {255, 140, 185, 255});
+    DrawCylinderWires(base, r, r, th, 28, {190, 70, 120, 255});
+}
+ 
 int main() {
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(1100, 720, "Ragdoll Avatar Template");
@@ -847,7 +1001,28 @@ int main() {
     float sleepTick = 0.0f;                 // counts up to SLEEP_INTERVAL, then sleepiness drops
     Vector3 focus = {0.0f, 0.0f, 0.0f};     // camera follows the avatar on the ground plane
  
+    // Food: disks dropped with the button. He eats them one at a time (oldest first).
+    std::vector<Food> foods;
+    int targetFood = -1;                    // index of the disk he is fetching / eating, or -1
+    auto SpawnFood = [&]() {                // drops from high above a random spot on the grass (not near the bed)
+        const float L = ARENA - 1.5f;
+        Vector3 p = {0.0f, 10.0f, 0.0f};
+        for (int tries = 0; tries < 50; tries++) {
+            p.x = (float)GetRandomValue((int)(-L * 100), (int)(L * 100)) / 100.0f;
+            p.z = (float)GetRandomValue((int)(-L * 100), (int)(L * 100)) / 100.0f;
+            if (!(p.x > BED.min.x - 1.0f && p.z > BED.min.z - 1.0f)) break;
+        }
+        foods.push_back({p, 0.0f, FOOD_FALLING});
+    };
+ 
     while (!WindowShouldClose()) {
+        // ---- "Drop food" button (top of the screen, left of the bars) ----
+        const int px = GetScreenWidth() - 310;
+        const Rectangle dropBtn = {(float)(px - 145), 12.0f, 128.0f, 32.0f};
+        const bool overBtn = CheckCollisionPointRec(GetMousePosition(), dropBtn);
+        const bool uiClick = overBtn && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+        if (uiClick) SpawnFood();
+ 
         // ---- camera: drag on empty space (left) or hold right mouse to turn ----
         if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || (draggingCam && IsMouseButtonDown(MOUSE_BUTTON_LEFT))) {
             Vector2 d = GetMouseDelta();
@@ -872,8 +1047,8 @@ int main() {
  
         // ---- template editing (rebuilds the skeleton, keeps position) ----
         bool rebuild = false;
-        if (IsKeyPressed(KEY_UP))    { look.height = Clamp(look.height + 0.05f, 1.20f, 2.10f); rebuild = true; }
-        if (IsKeyPressed(KEY_DOWN))  { look.height = Clamp(look.height - 0.05f, 1.20f, 2.10f); rebuild = true; }
+        if (HEIGHT_KEYS && IsKeyPressed(KEY_UP))   { look.height = Clamp(look.height + 0.05f, 1.20f, 2.10f); rebuild = true; }   // switched off for now
+        if (HEIGHT_KEYS && IsKeyPressed(KEY_DOWN)) { look.height = Clamp(look.height - 0.05f, 1.20f, 2.10f); rebuild = true; }
         if (IsKeyPressed(KEY_RIGHT)) { look.build  = Clamp(look.build  + 0.10f, 0.70f, 1.50f); rebuild = true; }
         if (IsKeyPressed(KEY_LEFT))  { look.build  = Clamp(look.build  - 0.10f, 0.70f, 1.50f); rebuild = true; }
         if (IsKeyPressed(KEY_K)) skinI  = (skinI  + 1) % Count(SKINS);
@@ -887,14 +1062,14 @@ int main() {
  
         // ---- pose / physics control ----
         if (IsKeyPressed(KEY_R)) avatar.HardReset();
-        if (IsKeyPressed(KEY_SPACE) && (avatar.mode == MODE_STANDING || avatar.mode == MODE_WALK)) avatar.GoLimp(true);   // knock over
+        if (IsKeyPressed(KEY_SPACE) && (avatar.mode == MODE_STANDING || avatar.mode == MODE_WALK || avatar.mode == MODE_FETCH || avatar.mode == MODE_EAT)) avatar.GoLimp(true);   // knock over
         if (IsKeyPressed(KEY_B)) mood = 5.0f;                                      // test shortcuts: miserable (continuous crying) ...
         if (IsKeyPressed(KEY_M)) mood = 15.0f;                                     // ... sad (occasional 1 s cry) ...
         if (IsKeyPressed(KEY_N)) mood = 100.0f;                                    // ... and happy (dances)
         if (IsKeyPressed(KEY_Z)) sleepiness = std::min(sleepiness, SLEEPY_AT);     // test shortcut: make him sleepy now
  
         // ---- mouse grab ----
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiClick) {
             Ray ray = GetMouseRay(GetMousePosition(), cam);
             float best = 1e9f; int hit = -1;
             for (int i = 0; i < JOINT_COUNT; i++) {
@@ -943,6 +1118,39 @@ int main() {
             while (sleepTick >= SLEEP_INTERVAL) { sleepTick -= SLEEP_INTERVAL; sleepiness -= SLEEP_DROP; }
         }
         sleepiness = Clamp(sleepiness, 0.0f, 100.0f);
+        // ---- food: falling, landing, and the disk he is eating ----
+        {
+            const float H = avatar.look.height, half = 0.006f * H;
+            const float dt = GetFrameTime();
+            for (Food& f : foods) {
+                if (f.state != FOOD_FALLING) continue;
+                f.vy -= 9.81f * dt;
+                f.pos.y += f.vy * dt;
+                if (f.pos.y <= half + 0.002f) { f.pos.y = half + 0.002f; f.vy = 0.0f; f.state = FOOD_LANDED; }
+            }
+            if (targetFood >= 0) {
+                Food& f = foods[targetFood];
+                if (avatar.foodEaten) {                                           // eaten: the disk is gone
+                    foods.erase(foods.begin() + targetFood);
+                    targetFood = -1; avatar.foodEaten = false;
+                } else if (avatar.mode != MODE_FETCH && avatar.mode != MODE_EAT) { // interrupted (grabbed, knocked over): drop it
+                    f.state = FOOD_LANDED; f.pos.y = half + 0.002f;
+                    targetFood = -1;
+                } else if (avatar.foodHeld) {
+                    f.pos = avatar.foodPos;                                       // rides in his hand
+                }
+            }
+            // On his feet and not busy dancing? Fetch the oldest disk lying on the floor.
+            if (targetFood < 0 && avatar.mode == MODE_STANDING && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f) {
+                for (size_t i = 0; i < foods.size(); i++) {
+                    if (foods[i].state != FOOD_LANDED) continue;
+                    targetFood = (int)i; foods[i].state = FOOD_TARGETED;
+                    avatar.StartFetch(foods[i].pos);
+                    break;
+                }
+            }
+        }
+ 
         // Tired enough (and on his feet)? Walk to the bed.
         if (avatar.mode == MODE_STANDING && sleepiness <= SLEEPY_AT && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f)
             avatar.StartWalkToBed();                            // (a dance in progress finishes first)
@@ -953,6 +1161,7 @@ int main() {
         BeginMode3D(cam);
             DrawArena();
             DrawBed();
+            for (const Food& f : foods) DrawFood(f, avatar.look.height);
             avatar.Draw();
         EndMode3D();
  
@@ -961,25 +1170,32 @@ int main() {
             DrawText("Zzz", (int)sp.x, (int)(sp.y + 6.0f * std::sin((float)GetTime() * 2.0f)), 26, DARKBLUE);
         }
  
-        DrawText("SPACE knock over   R reset   drag avatar joint / drag empty space = turn camera   Wheel zoom", 12, 10, 18, DARKGRAY);
-        DrawText("UP/DOWN height   LEFT/RIGHT build   K skin  H hair  C shirt  P pants", 12, 34, 18, DARKGRAY);
+        const int sh = GetScreenHeight();
+        DrawText("SPACE knock over   R reset   drag avatar joint / drag empty space = turn camera   Wheel zoom", 12, sh - 54, 18, DARKGRAY);
+        DrawText("LEFT/RIGHT build   K skin  H hair  C shirt  P pants   B/M/N mood   Z sleepy   (height keys off)", 12, sh - 30, 18, DARKGRAY);
         const char* state = "STANDING";
         if (avatar.mode == MODE_STANDING && avatar.danceT > 0.0f) state = "DANCING";
         else if (avatar.mode == MODE_STANDING && avatar.cryBlend > 0.5f) state = "CRYING";
         if (avatar.mode == MODE_GETUP) state = "GETTING UP";
         else if (avatar.mode == MODE_WALK) state = "WALKING TO BED";
+        else if (avatar.mode == MODE_FETCH) state = "WALKING TO FOOD";
+        else if (avatar.mode == MODE_EAT) state = "EATING";
         else if (avatar.mode == MODE_BEDANIM) state = avatar.bedReverse ? "GETTING OUT OF BED" : "GETTING INTO BED";
         else if (avatar.mode == MODE_RAGDOLL)
             state = avatar.asleep ? "ASLEEP" : avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
                                               : "RAGDOLL";
-        DrawText(TextFormat("height %.2f m   build %.1f   %s", look.height, look.build, state), 12, 58, 18, DARKGRAY);
+        DrawText(TextFormat("height %.2f m   build %.1f   %s", look.height, look.build, state), 12, 12, 18, DARKGRAY);
  
-        const int px = GetScreenWidth() - 310;
         DrawStatBar(px, 12, "Health", health, {220, 70, 70, 255});
         DrawStatBar(px, 38, "Mood",   mood,   MoodColor(mood));
         DrawStatBar(px, 64, "Hunger", hunger, {230, 160, 50, 255});
         DrawStatBar(px, 90, "Sleepiness", sleepiness, SleepColor(sleepiness));
         DrawLine(px + 100 + (int)(160 * SLEEPY_AT / 100.0f), 90, px + 100 + (int)(160 * SLEEPY_AT / 100.0f), 108, WHITE);   // "goes to bed" mark
+ 
+        DrawRectangleRec(dropBtn, overBtn ? Color{255, 160, 195, 255} : Color{240, 115, 165, 255});
+        DrawRectangleLinesEx(dropBtn, 2.0f, {150, 50, 90, 255});
+        const int labelW = MeasureText("Drop food", 18);
+        DrawText("Drop food", (int)(dropBtn.x + (dropBtn.width - labelW) / 2), (int)dropBtn.y + 7, 18, WHITE);
         EndDrawing();
     }
     CloseWindow();
