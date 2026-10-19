@@ -14,6 +14,12 @@
 //   R            hard reset to standing at the origin
 //   Left mouse   grab / drag / throw a joint (auto-enables ragdoll)
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
+//   Disks can be picked up, dragged and thrown with the mouse, like the avatar. They bounce off the walls and can land on the bed.
+//   While the mouse holds the avatar, his free hands go for a target (the nearest disk, or the bed if he is sleepy):
+//     held in the air          -> the free hands reach out for it
+//     dragged along the ground by a leg -> he crawls, hands alternating
+//   Sleepiness at 0 for 10 s: he drops (even from the mouse) and sleeps where he is; at 100 he wakes and gets up.
+//   X            test shortcut: set sleepiness to 0
 //   [Drop food] button (top of the screen): a pink disk drops onto a random spot of the grass. A standing avatar
 //                walks to it, crouches, picks it up, holds it to his mouth for 1 s, and it disappears.
 //   Height keys (UP/DOWN) are switched off for now (HEIGHT_KEYS).
@@ -197,9 +203,10 @@ static bool SegmentHitsBed(Vector3 a, Vector3 b, float margin) {
 }
  
 // Food: a small pink disk dropped from above. Drawn the size of his hand.
-enum FoodState { FOOD_FALLING, FOOD_LANDED, FOOD_TARGETED };
-struct Food { Vector3 pos; float vy; int state; };      // pos = centre of the disk
+enum FoodState { FOOD_FALLING, FOOD_LANDED, FOOD_TARGETED, FOOD_DRAGGED };
+struct Food { Vector3 pos; Vector3 vel; int state; };   // pos = centre of the disk
  
+static const float PASS_OUT_AFTER = 10.0f;  // seconds at zero sleepiness before he collapses and sleeps where he stands
 static const float FETCH_STOP = 0.34f;      // how far from the food he stops before crouching (m)
 static const bool  HEIGHT_KEYS = false;     // the height keys are switched off for now
  
@@ -249,6 +256,12 @@ struct Ragdoll {
     bool  bedReverse = false;              // true while getting OUT of bed
     float wakeBlend = 0.0f;                // 0..1: eases from wherever he was lying into the animation
     Vector3 wakeStart[JOINT_COUNT];
+ 
+    // Held by the mouse: the free hands react to a target (food, or the bed when sleepy)
+    bool    hasTarget = false;
+    Vector3 targetPos = {0, 0, 0};
+    float   activeClock = 0.0f;
+    bool    passedOut = false;                 // collapsed from exhaustion: sleeps wherever he is
  
     // Food fetching / eating
     Vector3 foodGoal = {0, 0, 0};              // world position of the food he is walking to
@@ -406,7 +419,7 @@ struct Ragdoll {
     // Snap to the standing pose at the current origin/yaw
     void Stand() {
         mode = MODE_STANDING; grabbed = -1; groundTimer = 0.0f; getupT = 0.0f;
-        bedTimer = 0.0f; asleep = false; walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f; bedT = 0.0f; bedReverse = false;
+        bedTimer = 0.0f; asleep = false; passedOut = false; walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f; bedT = 0.0f; bedReverse = false;
         foodHeld = false; danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; cryWindowT = 0.0f; cryBurstT = 0.0f; cryBurstDone = false; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
         ComputePose(KEY_STAND, origin, yaw, pos);
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
@@ -458,9 +471,19 @@ struct Ragdoll {
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
  
+    // Exhausted: he drops where he is (letting go of the mouse if held) and sleeps there.
+    void PassOut() {
+        if (mode != MODE_RAGDOLL) GoLimp(false);
+        if (grabbed >= 0) Release();
+        passedOut = true; asleep = true; bedTimer = 0.0f; groundTimer = 0.0f;
+    }
+ 
     // Get out of bed: the get-into-bed animation in reverse (lie -> sit on the edge -> stand beside the bed)
     void WakeUp() {
+        const bool onBed = OverBed(pos[PELVIS]) && pos[PELVIS].y > BED_H;
         asleep = false; bedTimer = 0.0f; grabbed = -1;
+        if (passedOut && !onBed) { passedOut = false; BeginGetUp(); return; }   // collapsed on the floor: just get up
+        passedOut = false;
         for (int i = 0; i < JOINT_COUNT; i++) wakeStart[i] = pos[i];
         mode = MODE_BEDANIM; bedReverse = true; wakeBlend = 0.0f;
         bedT = BED_SIT_T + BED_LIE_T;
@@ -494,6 +517,58 @@ struct Ragdoll {
         }
     }
  
+    // ------------------------------------------------------------------------
+    // Held by the mouse: the hands that are free do something purposeful
+    // ------------------------------------------------------------------------
+    static bool IsLeg(int j) { return j == L_HIP || j == R_HIP || j == L_KNEE || j == R_KNEE || j == L_FOOT || j == R_FOOT; }
+ 
+    // Spring a joint toward a goal (damped so it does not overshoot).
+    void PullJoint(int j, Vector3 goal, float k) {
+        pos[j]  = Vector3Add(pos[j], Vector3Scale(Vector3Subtract(goal, pos[j]), k));
+        prev[j] = Vector3Lerp(prev[j], pos[j], 0.4f);
+    }
+ 
+    void ActiveHold(float dt) {
+        activeClock += dt;
+        const float H = look.height, scale = H / 1.75f;
+        const float torsoLow = std::min(std::min(pos[PELVIS].y, pos[NECK].y), std::min(pos[L_SHO].y, pos[R_SHO].y));
+        const bool onGround = torsoLow < 0.10f * H;
+        const int hands[2] = {L_HAND, R_HAND}, shos[2] = {L_SHO, R_SHO}, elbs[2] = {L_ELB, R_ELB};
+ 
+        if (!onGround) {
+            // Hanging in the air: the free hands reach out for the target
+            for (int k = 0; k < 2; k++) {
+                if (hands[k] == grabbed) continue;
+                const Vector3 sh = pos[shos[k]];
+                const Vector3 d = Vector3Subtract(targetPos, sh);
+                const float dist = Vector3Length(d);
+                if (dist < 1e-4f) continue;
+                const float arm = Bone(shos[k], elbs[k]) + Bone(elbs[k], hands[k]);
+                const float grasp = 0.88f + 0.12f * std::sin(activeClock * 7.0f + k * PI);   // clutching at it
+                const Vector3 goal = dist <= arm ? targetPos : Vector3Add(sh, Vector3Scale(d, arm * grasp / dist));
+                PullJoint(hands[k], goal, 0.10f);
+            }
+        } else if (IsLeg(grabbed)) {
+            // Dragged along the ground by a leg: crawl, the hands taking turns to reach ahead and pull
+            const Vector3 chest = Vector3Lerp(pos[L_SHO], pos[R_SHO], 0.5f);
+            Vector3 d = {targetPos.x - chest.x, 0.0f, targetPos.z - chest.z};
+            const float dl = Vector3Length(d);
+            if (dl < 0.05f) return;
+            d = Vector3Scale(d, 1.0f / dl);
+            const float stride = 0.32f * scale, ahead = 0.42f * scale, lift = 0.12f * scale, rad = Radius(L_HAND);
+            for (int k = 0; k < 2; k++) {
+                const float u = std::fmod(activeClock * 0.9f + 0.5f * k, 1.0f);       // the two hands are half a cycle apart
+                const Vector3 sh = {pos[shos[k]].x, 0.0f, pos[shos[k]].z};
+                const Vector3 front = Vector3Add(sh, Vector3Scale(d, ahead));
+                const Vector3 back  = Vector3Add(sh, Vector3Scale(d, ahead - stride));
+                Vector3 p; float y;
+                if (u < 0.5f) { const float t = u * 2.0f;          p = Vector3Lerp(back, front, Smooth(t)); y = rad + lift * std::sin(PI * t); }   // swing forward, off the ground
+                else          { const float t = (u - 0.5f) * 2.0f; p = Vector3Lerp(front, back, t);         y = rad; }                            // planted, sliding back
+                PullJoint(hands[k], {p.x, y, p.z}, 0.25f);
+            }
+        }
+    }
+ 
     void StepRagdoll(float dt) {
         const Vector3 g = {0.0f, -9.81f, 0.0f};
         for (int i = 0; i < JOINT_COUNT; i++) {
@@ -502,6 +577,8 @@ struct Ragdoll {
             prev[i] = pos[i];
             pos[i] = Vector3Add(Vector3Add(pos[i], vel), Vector3Scale(g, dt * dt));
         }
+ 
+        if (grabbed >= 0 && !asleep && hasTarget) ActiveHold(dt);      // held by the mouse: hands crawl / reach
  
         // Collision detection: how fast is any joint about to hit the floor or a wall?
         impactCooldown -= dt;
@@ -537,7 +614,7 @@ struct Ragdoll {
         }
  
         // Bed: lying still on the mattress for a second puts the avatar to sleep
-        {
+        if (!passedOut) {
             const bool over  = OverBed(pos[PELVIS]) && pos[PELVIS].y < BED_H + 0.25f;
             const float speed = Vector3Length(Vector3Subtract(pos[PELVIS], prev[PELVIS])) / dt;
             if (grabbed < 0 && over && speed < 0.4f) bedTimer += dt;
@@ -546,7 +623,7 @@ struct Ragdoll {
         }
  
         // Fall detection: pelvis near the floor and nobody holding the avatar
-        if (grabbed < 0 && pos[PELVIS].y < 0.20f * look.height) groundTimer += dt;
+        if (!passedOut && grabbed < 0 && pos[PELVIS].y < 0.20f * look.height) groundTimer += dt;
         else groundTimer = 0.0f;
         if (groundTimer >= FALL_WAIT) BeginGetUp();
     }
@@ -1004,6 +1081,9 @@ int main() {
     // Food: disks dropped with the button. He eats them one at a time (oldest first).
     std::vector<Food> foods;
     int targetFood = -1;                    // index of the disk he is fetching / eating, or -1
+    int grabbedFood = -1;                   // index of the disk the mouse is holding, or -1
+    float foodGrabDist = 0.0f;
+    float zeroSleepTimer = 0.0f;            // seconds spent at zero sleepiness
     auto SpawnFood = [&]() {                // drops from high above a random spot on the grass (not near the bed)
         const float L = ARENA - 1.5f;
         Vector3 p = {0.0f, 10.0f, 0.0f};
@@ -1012,7 +1092,7 @@ int main() {
             p.z = (float)GetRandomValue((int)(-L * 100), (int)(L * 100)) / 100.0f;
             if (!(p.x > BED.min.x - 1.0f && p.z > BED.min.z - 1.0f)) break;
         }
-        foods.push_back({p, 0.0f, FOOD_FALLING});
+        foods.push_back({p, {0.0f, 0.0f, 0.0f}, FOOD_FALLING});
     };
  
     while (!WindowShouldClose()) {
@@ -1066,6 +1146,7 @@ int main() {
         if (IsKeyPressed(KEY_B)) mood = 5.0f;                                      // test shortcuts: miserable (continuous crying) ...
         if (IsKeyPressed(KEY_M)) mood = 15.0f;                                     // ... sad (occasional 1 s cry) ...
         if (IsKeyPressed(KEY_N)) mood = 100.0f;                                    // ... and happy (dances)
+        if (IsKeyPressed(KEY_X)) sleepiness = 0.0f;                                // test shortcut: exhausted (passes out after 10 s)
         if (IsKeyPressed(KEY_Z)) sleepiness = std::min(sleepiness, SLEEPY_AT);     // test shortcut: make him sleepy now
  
         // ---- mouse grab ----
@@ -1076,7 +1157,16 @@ int main() {
                 RayCollision c = GetRayCollisionSphere(ray, avatar.pos[i], 0.07f * avatar.look.height);
                 if (c.hit && c.distance < best) { best = c.distance; hit = i; }
             }
-            if (hit >= 0) {
+            int hitFood = -1; float bestFood = 1e9f;
+            for (size_t i = 0; i < foods.size(); i++) {
+                if (foods[i].state == FOOD_TARGETED) continue;           // he is already fetching / eating this one
+                RayCollision c = GetRayCollisionSphere(ray, foods[i].pos, 0.09f);
+                if (c.hit && c.distance < bestFood) { bestFood = c.distance; hitFood = (int)i; }
+            }
+            if (hitFood >= 0 && bestFood < best) {                       // the disk is closer than the avatar: pick it up
+                grabbedFood = hitFood; foodGrabDist = bestFood;
+                foods[hitFood].state = FOOD_DRAGGED; foods[hitFood].vel = {0.0f, 0.0f, 0.0f};
+            } else if (hit >= 0) {
                 if (avatar.mode != MODE_RAGDOLL) avatar.GoLimp(false);   // grabbing cancels a get-up too
                 avatar.grabbed = hit;
                 grabDist = best;
@@ -1095,9 +1185,43 @@ int main() {
             avatar.prev[avatar.grabbed] = avatar.pos[avatar.grabbed];
             avatar.pos[avatar.grabbed]  = t;
         }
-        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) { avatar.Release(); draggingCam = false; }
+        if (grabbedFood >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            Ray ray = GetMouseRay(GetMousePosition(), cam);
+            Vector3 t = Vector3Add(ray.position, Vector3Scale(ray.direction, foodGrabDist));
+            const float lim = ARENA - 0.1f, half = 0.006f * avatar.look.height;
+            t.x = Clamp(t.x, -lim, lim); t.z = Clamp(t.z, -lim, lim);
+            t.y = std::max(t.y, half + 0.002f);
+            PushOutOfBox(t, half, BED);
+            Food& f = foods[grabbedFood];
+            const float fdt = std::max(GetFrameTime(), 1e-4f);
+            f.vel = Vector3Lerp(f.vel, Vector3Scale(Vector3Subtract(t, f.pos), 1.0f / fdt), 0.5f);   // smoothed, for throwing
+            f.pos = t;
+        }
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            avatar.Release(); draggingCam = false;
+            if (grabbedFood >= 0) {                                      // let go: the disk drops (or flies, if thrown)
+                Food& f = foods[grabbedFood];
+                const float sp = Vector3Length(f.vel);
+                if (sp > 12.0f) f.vel = Vector3Scale(f.vel, 12.0f / sp);
+                f.state = FOOD_FALLING;
+                grabbedFood = -1;
+            }
+        }
  
         avatar.moodLevel = mood;
+        avatar.hasTarget = false;                                       // what his free hands go for while he is held:
+        {                                                               // the nearest disk, else the bed when he is sleepy
+            float bestD = 1e9f;
+            for (const Food& f : foods) {
+                if (f.state == FOOD_TARGETED) continue;
+                float d = Vector3Distance(f.pos, avatar.pos[PELVIS]);
+                if (d < bestD) { bestD = d; avatar.targetPos = f.pos; avatar.hasTarget = true; }
+            }
+            if (!avatar.hasTarget && sleepiness <= SLEEPY_AT) {
+                avatar.targetPos = {(BED.min.x + BED.max.x) * 0.5f, BED_H, BED_LIE_Z};
+                avatar.hasTarget = true;
+            }
+        }
         for (int i = 0; i < STEPS; i++) avatar.Step(DT);
  
         // ---- mood: drops on collisions, recovers +1 every second ----
@@ -1118,20 +1242,39 @@ int main() {
             while (sleepTick >= SLEEP_INTERVAL) { sleepTick -= SLEEP_INTERVAL; sleepiness -= SLEEP_DROP; }
         }
         sleepiness = Clamp(sleepiness, 0.0f, 100.0f);
+        // ---- exhaustion: 10 s at zero sleepiness and he drops where he is and falls asleep ----
+        if (sleepiness <= 0.0f && !avatar.asleep) zeroSleepTimer += GetFrameTime(); else zeroSleepTimer = 0.0f;
+        if (zeroSleepTimer >= PASS_OUT_AFTER) { avatar.PassOut(); zeroSleepTimer = 0.0f; }
+ 
         // ---- food: falling, landing, and the disk he is eating ----
         {
             const float H = avatar.look.height, half = 0.006f * H;
             const float dt = GetFrameTime();
+            const float wallLim = ARENA - 0.1f;
             for (Food& f : foods) {
-                if (f.state != FOOD_FALLING) continue;
-                f.vy -= 9.81f * dt;
-                f.pos.y += f.vy * dt;
-                if (f.pos.y <= half + 0.002f) { f.pos.y = half + 0.002f; f.vy = 0.0f; f.state = FOOD_LANDED; }
+                if (f.state != FOOD_FALLING) continue;                  // (dropped, thrown or just released)
+                f.vel.y -= 9.81f * dt;
+                f.pos = Vector3Add(f.pos, Vector3Scale(f.vel, dt));
+                if (f.pos.x >  wallLim) { f.pos.x =  wallLim; f.vel.x *= -0.3f; }   // walls
+                if (f.pos.x < -wallLim) { f.pos.x = -wallLim; f.vel.x *= -0.3f; }
+                if (f.pos.z >  wallLim) { f.pos.z =  wallLim; f.vel.z *= -0.3f; }
+                if (f.pos.z < -wallLim) { f.pos.z = -wallLim; f.vel.z *= -0.3f; }
+                PushOutOfBox(f.pos, half, BED);                         // the bed is solid; a disk can land on it
+                const bool onFloor = f.pos.y <= half + 0.002f;
+                if (onFloor) f.pos.y = half + 0.002f;
+                const bool onBed = OverBed(f.pos) && std::fabs(f.pos.y - (BED_H + half)) < 0.002f;
+                if (onFloor || onBed) {                                 // skids to a stop, then it has landed
+                    f.vel.y = 0.0f;
+                    const float fr = std::max(0.0f, 1.0f - 8.0f * dt);
+                    f.vel.x *= fr; f.vel.z *= fr;
+                    if (std::sqrt(f.vel.x * f.vel.x + f.vel.z * f.vel.z) < 0.05f) { f.vel = {0.0f, 0.0f, 0.0f}; f.state = FOOD_LANDED; }
+                }
             }
             if (targetFood >= 0) {
                 Food& f = foods[targetFood];
                 if (avatar.foodEaten) {                                           // eaten: the disk is gone
                     foods.erase(foods.begin() + targetFood);
+                    if (grabbedFood > targetFood) grabbedFood--;
                     targetFood = -1; avatar.foodEaten = false;
                 } else if (avatar.mode != MODE_FETCH && avatar.mode != MODE_EAT) { // interrupted (grabbed, knocked over): drop it
                     f.state = FOOD_LANDED; f.pos.y = half + 0.002f;
@@ -1143,7 +1286,7 @@ int main() {
             // On his feet and not busy dancing? Fetch the oldest disk lying on the floor.
             if (targetFood < 0 && avatar.mode == MODE_STANDING && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f) {
                 for (size_t i = 0; i < foods.size(); i++) {
-                    if (foods[i].state != FOOD_LANDED) continue;
+                    if (foods[i].state != FOOD_LANDED || OverBed(foods[i].pos)) continue;   // (can't reach one on the mattress)
                     targetFood = (int)i; foods[i].state = FOOD_TARGETED;
                     avatar.StartFetch(foods[i].pos);
                     break;
@@ -1172,7 +1315,7 @@ int main() {
  
         const int sh = GetScreenHeight();
         DrawText("SPACE knock over   R reset   drag avatar joint / drag empty space = turn camera   Wheel zoom", 12, sh - 54, 18, DARKGRAY);
-        DrawText("LEFT/RIGHT build   K skin  H hair  C shirt  P pants   B/M/N mood   Z sleepy   (height keys off)", 12, sh - 30, 18, DARKGRAY);
+        DrawText("LEFT/RIGHT build   K skin  H hair  C shirt  P pants   B/M/N mood   Z sleepy   X exhausted   (height keys off)", 12, sh - 30, 18, DARKGRAY);
         const char* state = "STANDING";
         if (avatar.mode == MODE_STANDING && avatar.danceT > 0.0f) state = "DANCING";
         else if (avatar.mode == MODE_STANDING && avatar.cryBlend > 0.5f) state = "CRYING";
@@ -1182,7 +1325,7 @@ int main() {
         else if (avatar.mode == MODE_EAT) state = "EATING";
         else if (avatar.mode == MODE_BEDANIM) state = avatar.bedReverse ? "GETTING OUT OF BED" : "GETTING INTO BED";
         else if (avatar.mode == MODE_RAGDOLL)
-            state = avatar.asleep ? "ASLEEP" : avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
+            state = avatar.asleep ? (avatar.passedOut ? "PASSED OUT" : "ASLEEP") : avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
                                               : "RAGDOLL";
         DrawText(TextFormat("height %.2f m   build %.1f   %s", look.height, look.build, state), 12, 12, 18, DARKGRAY);
  
@@ -1190,6 +1333,8 @@ int main() {
         DrawStatBar(px, 38, "Mood",   mood,   MoodColor(mood));
         DrawStatBar(px, 64, "Hunger", hunger, {230, 160, 50, 255});
         DrawStatBar(px, 90, "Sleepiness", sleepiness, SleepColor(sleepiness));
+        if (zeroSleepTimer > 0.0f)
+            DrawText(TextFormat("Exhausted - passing out in %.0fs", std::ceil(PASS_OUT_AFTER - zeroSleepTimer)), px, 116, 18, MAROON);
         DrawLine(px + 100 + (int)(160 * SLEEPY_AT / 100.0f), 90, px + 100 + (int)(160 * SLEEPY_AT / 100.0f), 108, WHITE);   // "goes to bed" mark
  
         DrawRectangleRec(dropBtn, overBtn ? Color{255, 160, 195, 255} : Color{240, 115, 165, 255});
