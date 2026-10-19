@@ -14,6 +14,8 @@
 //   R            hard reset to standing at the origin
 //   Left mouse   grab / drag / throw a joint (auto-enables ragdoll)
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
+//   Brick pile (5 wide x 8 long x 4 high) in the corner opposite the bed: for now the bricks can only be picked up,
+//   dragged and thrown with the mouse. Lift one out and whatever rested on it falls; they stack and slide.
 //   Disks can be picked up, dragged and thrown with the mouse, like the avatar. They bounce off the walls and can land on the bed.
 //   While the mouse holds the avatar, his free hands go for a target (the nearest disk, or the bed if he is sleepy):
 //     held in the air          -> the free hands reach out for it
@@ -1045,6 +1047,129 @@ static void DrawArena() {
     }
 }
  
+// ----------------------------------------------------------------------------
+// Bricks: a pile in the corner opposite the bed. For now they can only be picked up (and thrown)
+// with the mouse. They are axis-aligned boxes: they fall, stack, slide and settle, but do not tumble.
+// ----------------------------------------------------------------------------
+enum BrickState { BRICK_RESTING, BRICK_FALLING, BRICK_DRAGGED };
+struct Brick { Vector3 pos; Vector3 vel; int state; Color color; };   // pos = centre
+ 
+// About the size of his shoe, in the proportions 5 (wide) : 4 (high) : 8 (long)
+static const float BRICK_UNIT = 0.035f;
+static const float BRICK_W = 5.0f * BRICK_UNIT;    // 0.175 m  (x)
+static const float BRICK_H = 4.0f * BRICK_UNIT;    // 0.140 m  (y)
+static const float BRICK_L = 8.0f * BRICK_UNIT;    // 0.280 m  (z)
+static const Vector3 BRICK_HALF = {BRICK_W * 0.5f, BRICK_H * 0.5f, BRICK_L * 0.5f};
+ 
+// The pile: 5 bricks wide, 8 long, 4 high, in the -X/-Z corner (opposite the bed), long side along the wall
+static const int   PILE_X = 5, PILE_Z = 8, PILE_Y = 4;
+static const float PILE_GAP = 0.004f;
+static const float PILE_X0 = -ARENA + 0.35f, PILE_Z0 = -ARENA + 0.35f;
+static const float PILE_W = PILE_X * (BRICK_W + PILE_GAP), PILE_LEN = PILE_Z * (BRICK_L + PILE_GAP);
+ 
+static std::vector<Brick> MakePile() {
+    std::vector<Brick> v;
+    for (int iy = 0; iy < PILE_Y; iy++)
+        for (int ix = 0; ix < PILE_X; ix++)
+            for (int iz = 0; iz < PILE_Z; iz++) {
+                const int h = (ix * 7 + iy * 13 + iz * 5) % 5;                  // slight colour variation
+                Brick b;
+                b.pos = {PILE_X0 + (ix + 0.5f) * (BRICK_W + PILE_GAP), (iy + 0.5f) * BRICK_H, PILE_Z0 + (iz + 0.5f) * (BRICK_L + PILE_GAP)};
+                b.vel = {0.0f, 0.0f, 0.0f};
+                b.state = BRICK_RESTING;
+                b.color = {(unsigned char)(172 + h * 4), (unsigned char)(80 + h * 3), (unsigned char)(60 + h * 2), 255};
+                v.push_back(b);
+            }
+    return v;
+}
+ 
+static Box BrickBox(const Brick& b) {
+    return {{b.pos.x - BRICK_HALF.x, b.pos.y - BRICK_HALF.y, b.pos.z - BRICK_HALF.z},
+            {b.pos.x + BRICK_HALF.x, b.pos.y + BRICK_HALF.y, b.pos.z + BRICK_HALF.z}};
+}
+static BoundingBox BrickBounds(const Brick& b) { Box x = BrickBox(b); return {x.min, x.max}; }
+ 
+// Push box (centre c, half-size h) out of box (centre bc, half-size bh) along the axis of least overlap.
+// Returns 0 = no contact, 1 = pushed along x, 2 = pushed up, -2 = pushed down, 3 = pushed along z.
+static int ResolveBoxBox(Vector3& c, Vector3 h, Vector3 bc, Vector3 bh) {
+    const float dx = (h.x + bh.x) - std::fabs(c.x - bc.x);
+    const float dy = (h.y + bh.y) - std::fabs(c.y - bc.y);
+    const float dz = (h.z + bh.z) - std::fabs(c.z - bc.z);
+    if (dx <= 0.0f || dy <= 0.0f || dz <= 0.0f) return 0;
+    const float m = std::min(dx, std::min(dy, dz));
+    if (m < 1e-5f) return 0;                                    // ignore hairline contact
+    if (m == dy) { const bool up = c.y >= bc.y; c.y += up ? dy : -dy; return up ? 2 : -2; }
+    if (m == dx) { c.x += (c.x >= bc.x) ? dx : -dx; return 1; }
+    c.z += (c.z >= bc.z) ? dz : -dz; return 3;
+}
+ 
+static void StepBricks(std::vector<Brick>& bricks, float frameDt) {
+    const Vector3 bedC = {(BED.min.x + BED.max.x) * 0.5f, (BED.min.y + BED.max.y) * 0.5f, (BED.min.z + BED.max.z) * 0.5f};
+    const Vector3 bedH = {(BED.max.x - BED.min.x) * 0.5f, (BED.max.y - BED.min.y) * 0.5f, (BED.max.z - BED.min.z) * 0.5f};
+    const float limX = ARENA - 0.05f - BRICK_HALF.x, limZ = ARENA - 0.05f - BRICK_HALF.z;
+ 
+    // 1. A resting brick with nothing under it (its support was lifted away) starts to fall.
+    for (Brick& b : bricks) {
+        if (b.state != BRICK_RESTING) continue;
+        const float bottom = b.pos.y - BRICK_HALF.y;
+        bool supported = bottom < 0.003f;                                                   // the floor
+        if (!supported && std::fabs(bottom - BED_H) < 0.003f &&                              // the mattress
+            std::fabs(b.pos.x - bedC.x) < bedH.x + BRICK_HALF.x - 0.01f && std::fabs(b.pos.z - bedC.z) < bedH.z + BRICK_HALF.z - 0.01f)
+            supported = true;
+        for (size_t j = 0; j < bricks.size() && !supported; j++) {                          // another brick
+            const Brick& o = bricks[j];
+            if (&o == &b || o.state == BRICK_DRAGGED) continue;
+            if (std::fabs(bottom - (o.pos.y + BRICK_HALF.y)) < 0.003f &&
+                std::fabs(b.pos.x - o.pos.x) < BRICK_W - 0.01f && std::fabs(b.pos.z - o.pos.z) < BRICK_L - 0.01f)
+                supported = true;
+        }
+        if (!supported) { b.state = BRICK_FALLING; b.vel = {0.0f, 0.0f, 0.0f}; }
+    }
+ 
+    // 2. Falling bricks (dropped, thrown, or whose support went): in small sub-steps so none tunnels through another
+    const int SUB = 4;
+    const float h = frameDt / SUB;
+    for (int sub = 0; sub < SUB; sub++) {
+        for (size_t i = 0; i < bricks.size(); i++) {
+            Brick& b = bricks[i];
+            if (b.state != BRICK_FALLING) continue;
+            b.vel.y -= 9.81f * h;
+            b.pos = Vector3Add(b.pos, Vector3Scale(b.vel, h));
+            if (b.pos.x >  limX) { b.pos.x =  limX; b.vel.x *= -0.2f; }                     // walls
+            if (b.pos.x < -limX) { b.pos.x = -limX; b.vel.x *= -0.2f; }
+            if (b.pos.z >  limZ) { b.pos.z =  limZ; b.vel.z *= -0.2f; }
+            if (b.pos.z < -limZ) { b.pos.z = -limZ; b.vel.z *= -0.2f; }
+ 
+            bool landed = false;
+            if (b.pos.y <= BRICK_HALF.y) { b.pos.y = BRICK_HALF.y; landed = true; }          // floor
+            auto react = [&](int axis) {
+                if (axis == 2) landed = true;
+                else if (axis == 1) b.vel.x = 0.0f;
+                else if (axis == 3) b.vel.z = 0.0f;
+                else if (axis == -2) b.vel.y = std::min(b.vel.y, 0.0f);
+            };
+            react(ResolveBoxBox(b.pos, BRICK_HALF, bedC, bedH));                             // the bed
+            for (size_t j = 0; j < bricks.size(); j++)                                       // other bricks
+                if (j != i && bricks[j].state != BRICK_DRAGGED)
+                    react(ResolveBoxBox(b.pos, BRICK_HALF, bricks[j].pos, BRICK_HALF));
+ 
+            if (landed) {                                                                    // skid to a stop, then rest
+                b.vel.y = 0.0f;
+                const float fr = std::max(0.0f, 1.0f - 8.0f * h);
+                b.vel.x *= fr; b.vel.z *= fr;
+                if (std::sqrt(b.vel.x * b.vel.x + b.vel.z * b.vel.z) < 0.05f) { b.vel = {0.0f, 0.0f, 0.0f}; b.state = BRICK_RESTING; }
+            }
+        }
+    }
+}
+ 
+static void DrawBrick(const Brick& b) {
+    Color c = b.color;
+    if (b.state == BRICK_DRAGGED) c = {(unsigned char)std::min(255, c.r + 45), (unsigned char)std::min(255, c.g + 45), (unsigned char)std::min(255, c.b + 45), 255};
+    DrawCube(b.pos, BRICK_W, BRICK_H, BRICK_L, c);
+    DrawCubeWires(b.pos, BRICK_W, BRICK_H, BRICK_L, {95, 40, 30, 255});
+}
+ 
 static void DrawFood(const Food& f, float H) {
     const float r = 0.03f * H, th = 0.012f * H;            // a disk the size of his hand
     const Vector3 base = {f.pos.x, f.pos.y - th * 0.5f, f.pos.z};
@@ -1082,6 +1207,9 @@ int main() {
     std::vector<Food> foods;
     int targetFood = -1;                    // index of the disk he is fetching / eating, or -1
     int grabbedFood = -1;                   // index of the disk the mouse is holding, or -1
+    std::vector<Brick> bricks = MakePile(); // the brick pile (opposite corner from the bed)
+    int grabbedBrick = -1;                  // index of the brick the mouse is holding, or -1
+    float brickGrabDist = 0.0f;
     float foodGrabDist = 0.0f;
     float zeroSleepTimer = 0.0f;            // seconds spent at zero sleepiness
     auto SpawnFood = [&]() {                // drops from high above a random spot on the grass (not near the bed)
@@ -1090,7 +1218,9 @@ int main() {
         for (int tries = 0; tries < 50; tries++) {
             p.x = (float)GetRandomValue((int)(-L * 100), (int)(L * 100)) / 100.0f;
             p.z = (float)GetRandomValue((int)(-L * 100), (int)(L * 100)) / 100.0f;
-            if (!(p.x > BED.min.x - 1.0f && p.z > BED.min.z - 1.0f)) break;
+            const bool nearBed  = p.x > BED.min.x - 1.0f && p.z > BED.min.z - 1.0f;
+            const bool nearPile = p.x < PILE_X0 + PILE_W + 1.0f && p.z < PILE_Z0 + PILE_LEN + 1.0f;
+            if (!nearBed && !nearPile) break;
         }
         foods.push_back({p, {0.0f, 0.0f, 0.0f}, FOOD_FALLING});
     };
@@ -1163,7 +1293,16 @@ int main() {
                 RayCollision c = GetRayCollisionSphere(ray, foods[i].pos, 0.09f);
                 if (c.hit && c.distance < bestFood) { bestFood = c.distance; hitFood = (int)i; }
             }
-            if (hitFood >= 0 && bestFood < best) {                       // the disk is closer than the avatar: pick it up
+            int hitBrick = -1; float bestBrick = 1e9f;
+            for (size_t i = 0; i < bricks.size(); i++) {
+                if (bricks[i].state == BRICK_DRAGGED) continue;
+                RayCollision c = GetRayCollisionBox(ray, BrickBounds(bricks[i]));
+                if (c.hit && c.distance < bestBrick) { bestBrick = c.distance; hitBrick = (int)i; }
+            }
+            if (hitBrick >= 0 && bestBrick < best && bestBrick < bestFood) {   // a brick is the nearest thing under the cursor
+                grabbedBrick = hitBrick; brickGrabDist = bestBrick;
+                bricks[hitBrick].state = BRICK_DRAGGED; bricks[hitBrick].vel = {0.0f, 0.0f, 0.0f};
+            } else if (hitFood >= 0 && bestFood < best) {                // the disk is closer than the avatar: pick it up
                 grabbedFood = hitFood; foodGrabDist = bestFood;
                 foods[hitFood].state = FOOD_DRAGGED; foods[hitFood].vel = {0.0f, 0.0f, 0.0f};
             } else if (hit >= 0) {
@@ -1197,7 +1336,27 @@ int main() {
             f.vel = Vector3Lerp(f.vel, Vector3Scale(Vector3Subtract(t, f.pos), 1.0f / fdt), 0.5f);   // smoothed, for throwing
             f.pos = t;
         }
+        if (grabbedBrick >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            Ray ray = GetMouseRay(GetMousePosition(), cam);
+            Vector3 t = Vector3Add(ray.position, Vector3Scale(ray.direction, brickGrabDist));
+            t.x = Clamp(t.x, -(ARENA - 0.05f - BRICK_HALF.x), ARENA - 0.05f - BRICK_HALF.x);
+            t.z = Clamp(t.z, -(ARENA - 0.05f - BRICK_HALF.z), ARENA - 0.05f - BRICK_HALF.z);
+            t.y = std::max(t.y, BRICK_HALF.y);
+            ResolveBoxBox(t, BRICK_HALF, {(BED.min.x + BED.max.x) * 0.5f, BED_H * 0.5f, (BED.min.z + BED.max.z) * 0.5f},
+                          {(BED.max.x - BED.min.x) * 0.5f, BED_H * 0.5f, (BED.max.z - BED.min.z) * 0.5f});   // not through the bed
+            Brick& b = bricks[grabbedBrick];
+            const float bdt = std::max(GetFrameTime(), 1e-4f);
+            b.vel = Vector3Lerp(b.vel, Vector3Scale(Vector3Subtract(t, b.pos), 1.0f / bdt), 0.5f);     // smoothed, for throwing
+            b.pos = t;
+        }
         if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            if (grabbedBrick >= 0) {                                     // let go: the brick drops (or flies, if thrown)
+                Brick& b = bricks[grabbedBrick];
+                const float sp = Vector3Length(b.vel);
+                if (sp > 8.0f) b.vel = Vector3Scale(b.vel, 8.0f / sp);
+                b.state = BRICK_FALLING;
+                grabbedBrick = -1;
+            }
             avatar.Release(); draggingCam = false;
             if (grabbedFood >= 0) {                                      // let go: the disk drops (or flies, if thrown)
                 Food& f = foods[grabbedFood];
@@ -1260,15 +1419,30 @@ int main() {
                 if (f.pos.z >  wallLim) { f.pos.z =  wallLim; f.vel.z *= -0.3f; }
                 if (f.pos.z < -wallLim) { f.pos.z = -wallLim; f.vel.z *= -0.3f; }
                 PushOutOfBox(f.pos, half, BED);                         // the bed is solid; a disk can land on it
+                bool onBrick = false;
+                for (const Brick& b : bricks) {                         // so are the bricks
+                    if (b.state == BRICK_DRAGGED) continue;
+                    const float before = f.pos.y;
+                    PushOutOfBox(f.pos, half, BrickBox(b));
+                    if (f.pos.y > before + 1e-6f) onBrick = true;
+                }
                 const bool onFloor = f.pos.y <= half + 0.002f;
                 if (onFloor) f.pos.y = half + 0.002f;
                 const bool onBed = OverBed(f.pos) && std::fabs(f.pos.y - (BED_H + half)) < 0.002f;
-                if (onFloor || onBed) {                                 // skids to a stop, then it has landed
+                if (onFloor || onBed || onBrick) {                                 // skids to a stop, then it has landed
                     f.vel.y = 0.0f;
                     const float fr = std::max(0.0f, 1.0f - 8.0f * dt);
                     f.vel.x *= fr; f.vel.z *= fr;
                     if (std::sqrt(f.vel.x * f.vel.x + f.vel.z * f.vel.z) < 0.05f) { f.vel = {0.0f, 0.0f, 0.0f}; f.state = FOOD_LANDED; }
                 }
+            }
+            for (Food& f : foods) {                                     // a disk resting on a brick that was lifted away falls again
+                if (f.state != FOOD_LANDED || f.pos.y < 0.05f) continue;
+                bool supported = OverBed(f.pos) && std::fabs(f.pos.y - (BED_H + half)) < 0.004f;
+                for (const Brick& b : bricks)
+                    if (!supported && b.state != BRICK_DRAGGED && std::fabs(f.pos.x - b.pos.x) < BRICK_HALF.x && std::fabs(f.pos.z - b.pos.z) < BRICK_HALF.z &&
+                        std::fabs(f.pos.y - (b.pos.y + BRICK_HALF.y + half)) < 0.004f) supported = true;
+                if (!supported) { f.state = FOOD_FALLING; f.vel = {0.0f, 0.0f, 0.0f}; }
             }
             if (targetFood >= 0) {
                 Food& f = foods[targetFood];
@@ -1286,13 +1460,15 @@ int main() {
             // On his feet and not busy dancing? Fetch the oldest disk lying on the floor.
             if (targetFood < 0 && avatar.mode == MODE_STANDING && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f) {
                 for (size_t i = 0; i < foods.size(); i++) {
-                    if (foods[i].state != FOOD_LANDED || OverBed(foods[i].pos)) continue;   // (can't reach one on the mattress)
+                    if (foods[i].state != FOOD_LANDED || foods[i].pos.y > 0.05f) continue;   // (can't reach one lying on the bed or the bricks)
                     targetFood = (int)i; foods[i].state = FOOD_TARGETED;
                     avatar.StartFetch(foods[i].pos);
                     break;
                 }
             }
         }
+ 
+        StepBricks(bricks, GetFrameTime());
  
         // Tired enough (and on his feet)? Walk to the bed.
         if (avatar.mode == MODE_STANDING && sleepiness <= SLEEPY_AT && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f)
@@ -1304,6 +1480,7 @@ int main() {
         BeginMode3D(cam);
             DrawArena();
             DrawBed();
+            for (const Brick& b : bricks) DrawBrick(b);
             for (const Food& f : foods) DrawFood(f, avatar.look.height);
             avatar.Draw();
         EndMode3D();
