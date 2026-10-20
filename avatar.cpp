@@ -14,6 +14,9 @@
 //   R            hard reset to standing at the origin
 //   Left mouse   grab / drag / throw a joint (auto-enables ragdoll)
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
+//   Screen on the -Z wall at his eye level, as wide as he is tall. Click it to switch it on / off. It plays screen.gif
+//   (next to the program, or pass a path as the first argument) at a fixed 10 frames/s; until then a test pattern.
+//   An Entertainment bar (placeholder for now) sits under Sleepiness.
 //   Brick pile (5 wide x 8 long x 4 high) in the corner opposite the bed: pick up, drag and throw them with the mouse.
 //   Lift one out and whatever rested on it falls; they stack and slide. Bricks collide with the avatar: a hard enough hit
 //   costs mood and he puts a hand to the spot and rubs it (higher spot = stands tall, lower = hunches over). A ragdoll
@@ -39,11 +42,13 @@
 //   K / H / C / P  cycle skin / hair / shirt / pants colours
  
 #include "raylib.h"
+#include "rlgl.h"          // for drawing the textured screen
 #include "raymath.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <functional>
+#include <cstring>
  
 // ----------------------------------------------------------------------------
 // Template data
@@ -1103,8 +1108,10 @@ static Color SleepColor(float v) {
     return MixColor(dark, light, v / 100.0f);
 }
  
+static const int STAT_LX = 135;              // width of the label column of the stat bars
+ 
 static void DrawStatBar(int x, int y, const char* label, float value, Color fill) {
-    const int w = 160, h = 18, lx = 100;     // lx = label column width
+    const int w = 160, h = 18, lx = STAT_LX;
     DrawText(label, x, y, 18, DARKGRAY);
     DrawRectangle(x + lx, y, w, h, {50, 50, 50, 170});
     DrawRectangle(x + lx, y, (int)(w * Clamp(value, 0.0f, 100.0f) / 100.0f), h, fill);
@@ -1441,6 +1448,126 @@ static void DrawBrick(const Brick& b) {
     DrawCubeWires(b.pos, BRICK_W, BRICK_H, BRICK_L, {95, 40, 30, 255});
 }
  
+// ----------------------------------------------------------------------------
+// The screen: a TV on the wall at his eye level, as wide as he is tall. It plays a GIF when one is provided
+// (screen.gif next to the program, or pass a path as the first argument). Until then it shows a test pattern.
+// Clicking it switches it on / off.
+// ----------------------------------------------------------------------------
+static const char* SCREEN_GIF_PATH = "screen.gif";
+static const float SCREEN_GIF_FPS  = 10.0f;     // raylib does not expose per-frame GIF delays, so GIFs play at this fixed rate
+static const float SCREEN_PANEL_T  = 0.15f;     // thickness of the raised wall section the screen is mounted on (the arena walls are only 1 m tall)
+ 
+struct ScreenMedia {
+    Texture2D tex = {};
+    Image gif = {};                              // every frame of the GIF, stacked (when one was loaded)
+    std::vector<unsigned char> generated;        // test-pattern frames (when there is no GIF)
+    int w = 320, h = 180, frames = 1, shown = -1;
+    float fps = SCREEN_GIF_FPS;
+    bool fromFile = false;
+    const unsigned char* Frame(int i) const {
+        const unsigned char* base = fromFile ? (const unsigned char*)gif.data : generated.data();
+        return base + (size_t)i * (size_t)w * (size_t)h * 4;
+    }
+};
+ 
+static ScreenMedia LoadScreenMedia(const char* path) {
+    ScreenMedia m;
+    int frames = 0;
+    Image g = FileExists(path) ? LoadImageAnim(path, &frames) : Image{};
+    if (g.data != nullptr && frames > 0 && g.width > 0 && g.height > 0) {
+        m.gif = g; m.w = g.width; m.h = g.height; m.frames = frames; m.fromFile = true;
+    } else {
+        if (g.data != nullptr) UnloadImage(g);
+        // No GIF yet: colour bars with a sweeping band and a bouncing block
+        m.w = 320; m.h = 180; m.frames = 24; m.fps = 12.0f; m.fromFile = false;
+        m.generated.resize((size_t)m.w * m.h * 4 * m.frames);
+        const Color bars[7] = {{190, 190, 190, 255}, {190, 190, 40, 255}, {40, 190, 190, 255}, {40, 190, 40, 255},
+                               {190, 40, 190, 255}, {190, 40, 40, 255}, {40, 40, 190, 255}};
+        const int barH = m.h * 2 / 3;
+        for (int f = 0; f < m.frames; f++) {
+            Image im = GenImageColor(m.w, m.h, {16, 18, 26, 255});
+            for (int i = 0; i < 7; i++) ImageDrawRectangle(&im, i * m.w / 7, 0, m.w / 7 + 1, barH, bars[i]);
+            ImageDrawRectangle(&im, 0, f * barH / m.frames, m.w, 6, {240, 240, 240, 255});
+            const int bx = (int)((0.5f - 0.5f * std::cos(2.0f * PI * f / m.frames)) * (m.w - 40));
+            ImageDrawRectangle(&im, bx, barH + 14, 40, 28, WHITE);
+            ImageDrawText(&im, "NO SIGNAL", 12, m.h - 38, 22, {220, 220, 220, 255});
+            ImageDrawText(&im, "put screen.gif next to the program", 12, m.h - 16, 10, {160, 160, 170, 255});
+            std::memcpy(m.generated.data() + (size_t)f * m.w * m.h * 4, im.data, (size_t)m.w * m.h * 4);
+            UnloadImage(im);
+        }
+    }
+    Image first = {(void*)m.Frame(0), m.w, m.h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};   // (shares the memory; not unloaded)
+    m.tex = LoadTextureFromImage(first);
+    SetTextureFilter(m.tex, TEXTURE_FILTER_BILINEAR);
+    m.shown = 0;
+    return m;
+}
+ 
+static void UnloadScreenMedia(ScreenMedia& m) {
+    UnloadTexture(m.tex);
+    if (m.fromFile) UnloadImage(m.gif);
+}
+ 
+static void UpdateScreenFrame(ScreenMedia& m, float clock) {            // show the right GIF frame for this time
+    const int fi = m.frames > 0 ? (int)(clock * m.fps) % m.frames : 0;
+    if (fi != m.shown) { UpdateTexture(m.tex, m.Frame(fi)); m.shown = fi; }
+}
+ 
+// Where the screen is: centred on the -Z wall (facing into the room), centred on his eye level.
+struct ScreenGeom { float cx, cy, z, w, h, panelW, panelH; };
+static ScreenGeom ScreenGeometry(float H, float aspect) {            // aspect = picture height / width
+    ScreenGeom g;
+    g.w = H;                                   // as wide as he is tall
+    g.h = g.w * aspect;
+    if (g.h > 2.3f) { g.h = 2.3f; g.w = g.h / aspect; }               // (a very tall GIF: keep it within the room)
+    g.cx = 0.0f;
+    g.cy = 0.94f * H;                          // his eyes
+    g.z  = -ARENA + SCREEN_PANEL_T + 0.06f + 0.002f;                  // the picture plane, just in front of the bezel
+    g.panelW = g.w + 0.5f;
+    g.panelH = g.cy + g.h * 0.5f + 0.25f;
+    return g;
+}
+ 
+// Distance along the ray to the screen (bezel included), or -1 if it misses or comes from behind the wall.
+static float ScreenHitDistance(const Ray& ray, const ScreenGeom& g) {
+    if (ray.direction.z >= -1e-6f) return -1.0f;
+    const float t = (g.z - ray.position.z) / ray.direction.z;
+    if (t < 0.0f) return -1.0f;
+    const float x = ray.position.x + ray.direction.x * t, y = ray.position.y + ray.direction.y * t;
+    const float m = 0.06f;
+    if (std::fabs(x - g.cx) > g.w * 0.5f + m || std::fabs(y - g.cy) > g.h * 0.5f + m) return -1.0f;
+    return t;
+}
+ 
+static void DrawTexturedQuad(Texture2D tex, const ScreenGeom& g) {
+    const float x0 = g.cx - g.w * 0.5f, x1 = g.cx + g.w * 0.5f, y0 = g.cy - g.h * 0.5f, y1 = g.cy + g.h * 0.5f;
+    rlSetTexture(tex.id);
+    rlBegin(RL_QUADS);
+        rlColor4ub(255, 255, 255, 255);
+        rlNormal3f(0.0f, 0.0f, 1.0f);
+        rlTexCoord2f(0.0f, 1.0f); rlVertex3f(x0, y0, g.z);      // bottom left (v = 1 is the bottom row of the picture)
+        rlTexCoord2f(1.0f, 1.0f); rlVertex3f(x1, y0, g.z);
+        rlTexCoord2f(1.0f, 0.0f); rlVertex3f(x1, y1, g.z);
+        rlTexCoord2f(0.0f, 0.0f); rlVertex3f(x0, y1, g.z);
+    rlEnd();
+    rlSetTexture(0);
+}
+ 
+static void DrawScreenOnWall(const ScreenMedia& m, const ScreenGeom& g, bool on, bool hover) {
+    // the raised section of wall it hangs on
+    const Vector3 panelC = {g.cx, g.panelH * 0.5f, -ARENA + SCREEN_PANEL_T * 0.5f};
+    DrawCube(panelC, g.panelW, g.panelH, SCREEN_PANEL_T, {206, 200, 188, 255});
+    DrawCubeWires(panelC, g.panelW, g.panelH, SCREEN_PANEL_T, {150, 144, 132, 255});
+    // bezel, picture (or a dark glass when off), power light
+    const Vector3 bezelC = {g.cx, g.cy, -ARENA + SCREEN_PANEL_T + 0.03f};
+    DrawCube(bezelC, g.w + 0.12f, g.h + 0.12f, 0.06f, {24, 24, 28, 255});
+    if (on) DrawTexturedQuad(m.tex, g);
+    else    DrawCube({g.cx, g.cy, g.z - 0.002f}, g.w, g.h, 0.004f, {12, 14, 20, 255});
+    DrawCube({g.cx + g.w * 0.5f - 0.04f, g.cy - g.h * 0.5f - 0.03f, g.z}, 0.03f, 0.015f, 0.01f,
+             on ? Color{70, 230, 100, 255} : Color{210, 50, 50, 255});
+    if (hover) DrawCubeWires(bezelC, g.w + 0.12f, g.h + 0.12f, 0.06f, WHITE);
+}
+ 
 static void DrawFood(const Food& f, float H) {
     const float r = 0.03f * H, th = 0.012f * H;            // a disk the size of his hand
     const Vector3 base = {f.pos.x, f.pos.y - th * 0.5f, f.pos.z};
@@ -1448,7 +1575,7 @@ static void DrawFood(const Food& f, float H) {
     DrawCylinderWires(base, r, r, th, 28, {190, 70, 120, 255});
 }
  
-int main() {
+int main(int argc, char** argv) {
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(1100, 720, "Ragdoll Avatar Template");
     SetTargetFPS(60);
@@ -1463,12 +1590,18 @@ int main() {
     Ragdoll avatar;
     avatar.Build(look);
  
+    // The screen on the wall (a GIF can be given as the first argument; default screen.gif)
+    ScreenMedia screen = LoadScreenMedia(argc > 1 ? argv[1] : SCREEN_GIF_PATH);
+    bool  screenOn = true;
+    float screenClock = 0.0f;               // runs only while the screen is on, so the GIF resumes where it left off
+ 
     float yaw = 0.6f, pitch = 0.25f, dist = 4.0f;
     float grabDist = 0.0f;
     bool  draggingCam = false;              // left-drag that started on empty space
  
     // Needs (0..100). Health and hunger are placeholders for now; only mood is live.
     float health = 100.0f, hunger = 100.0f, mood = 100.0f;
+    float entertainment = 100.0f;           // placeholder for now (nothing changes it yet)
     float moodTick = 0.0f;                  // counts up to MOOD_REGEN_INTERVAL, then mood recovers by 1 point
     float sleepiness = 100.0f;              // 100 = rested (light blue), 0 = exhausted (dark blue)
     float sleepTick = 0.0f;                 // counts up to SLEEP_INTERVAL, then sleepiness drops
@@ -1501,7 +1634,7 @@ int main() {
  
     while (!WindowShouldClose()) {
         // ---- "Drop food" button (top of the screen, left of the bars) ----
-        const int px = GetScreenWidth() - 310;
+        const int px = GetScreenWidth() - 345;
         const Rectangle dropBtn = {(float)(px - 145), 12.0f, 128.0f, 32.0f};
         const bool overBtn = CheckCollisionPointRec(GetMousePosition(), dropBtn);
         const bool uiClick = overBtn && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
@@ -1553,6 +1686,12 @@ int main() {
         if (IsKeyPressed(KEY_X)) sleepiness = 0.0f;                                // test shortcut: exhausted (passes out after 10 s)
         if (IsKeyPressed(KEY_Z)) sleepiness = std::min(sleepiness, SLEEPY_AT);     // test shortcut: make him sleepy now
  
+        // ---- the screen on the wall: play it, and check whether the mouse is over it ----
+        const ScreenGeom sg = ScreenGeometry(avatar.look.height, (float)screen.h / (float)screen.w);
+        if (screenOn) { screenClock += GetFrameTime(); UpdateScreenFrame(screen, screenClock); }
+        const float screenDist = ScreenHitDistance(GetMouseRay(GetMousePosition(), cam), sg);
+        const bool screenHover = screenDist >= 0.0f && !overBtn;
+ 
         // ---- mouse grab ----
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiClick) {
             Ray ray = GetMouseRay(GetMousePosition(), cam);
@@ -1573,7 +1712,10 @@ int main() {
                 RayCollision c = GetRayCollisionBox(ray, BrickBounds(bricks[i]));
                 if (c.hit && c.distance < bestBrick) { bestBrick = c.distance; hitBrick = (int)i; }
             }
-            if (hitBrick >= 0 && bestBrick < best && bestBrick < bestFood) {   // a brick is the nearest thing under the cursor
+            const bool screenFirst = screenDist >= 0.0f && screenDist < best && screenDist < bestFood && screenDist < bestBrick;
+            if (screenFirst) {
+                screenOn = !screenOn;                                    // click the screen: on / off
+            } else if (hitBrick >= 0 && bestBrick < best && bestBrick < bestFood) {   // a brick is the nearest thing under the cursor
                 grabbedBrick = hitBrick; brickGrabDist = bestBrick;
                 bricks[hitBrick].state = BRICK_DRAGGED; bricks[hitBrick].vel = {0.0f, 0.0f, 0.0f};
             } else if (hitFood >= 0 && bestFood < best) {                // the disk is closer than the avatar: pick it up
@@ -1765,6 +1907,7 @@ int main() {
         BeginMode3D(cam);
             DrawArena();
             DrawBed();
+            DrawScreenOnWall(screen, sg, screenOn, screenHover);
             for (const Brick& b : bricks) DrawBrick(b);
             for (const Food& f : foods) DrawFood(f, avatar.look.height);
             avatar.Draw();
@@ -1796,9 +1939,15 @@ int main() {
         DrawStatBar(px, 38, "Mood",   mood,   MoodColor(mood));
         DrawStatBar(px, 64, "Hunger", hunger, {230, 160, 50, 255});
         DrawStatBar(px, 90, "Sleepiness", sleepiness, SleepColor(sleepiness));
+        DrawStatBar(px, 116, "Entertainment", entertainment, {185, 110, 225, 255});   // placeholder
         if (zeroSleepTimer > 0.0f)
-            DrawText(TextFormat("Exhausted - passing out in %.0fs", std::ceil(PASS_OUT_AFTER - zeroSleepTimer)), px, 116, 18, MAROON);
-        DrawLine(px + 100 + (int)(160 * SLEEPY_AT / 100.0f), 90, px + 100 + (int)(160 * SLEEPY_AT / 100.0f), 108, WHITE);   // "goes to bed" mark
+            DrawText(TextFormat("Exhausted - passing out in %.0fs", std::ceil(PASS_OUT_AFTER - zeroSleepTimer)), px, 142, 18, MAROON);
+        DrawLine(px + STAT_LX + (int)(160 * SLEEPY_AT / 100.0f), 90, px + STAT_LX + (int)(160 * SLEEPY_AT / 100.0f), 108, WHITE);   // "goes to bed" mark
+        if (screenHover) {                                                // a hint while the mouse is over the screen
+            const Vector2 mp = GetMousePosition();
+            DrawText(screenOn ? "Click: switch the screen off" : "Click: switch the screen on", (int)mp.x + 17, (int)mp.y + 19, 18, BLACK);
+            DrawText(screenOn ? "Click: switch the screen off" : "Click: switch the screen on", (int)mp.x + 16, (int)mp.y + 18, 18, WHITE);
+        }
  
         DrawRectangleRec(dropBtn, overBtn ? Color{255, 160, 195, 255} : Color{240, 115, 165, 255});
         DrawRectangleLinesEx(dropBtn, 2.0f, {150, 50, 90, 255});
@@ -1806,7 +1955,7 @@ int main() {
         DrawText("Drop food", (int)(dropBtn.x + (dropBtn.width - labelW) / 2), (int)dropBtn.y + 7, 18, WHITE);
         EndDrawing();
     }
+    UnloadScreenMedia(screen);
     CloseWindow();
     return 0;
 }
- 
