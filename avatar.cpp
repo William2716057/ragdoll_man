@@ -14,8 +14,10 @@
 //   R            hard reset to standing at the origin
 //   Left mouse   grab / drag / throw a joint (auto-enables ragdoll)
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
-//   Brick pile (5 wide x 8 long x 4 high) in the corner opposite the bed: for now the bricks can only be picked up,
-//   dragged and thrown with the mouse. Lift one out and whatever rested on it falls; they stack and slide.
+//   Brick pile (5 wide x 8 long x 4 high) in the corner opposite the bed: pick up, drag and throw them with the mouse.
+//   Lift one out and whatever rested on it falls; they stack and slide. Bricks collide with the avatar: a hard enough hit
+//   costs mood and he puts a hand to the spot and rubs it (higher spot = stands tall, lower = hunches over). A ragdoll
+//   avatar is pushed by the brick; a standing one is not (the brick bounces off).
 //   Disks can be picked up, dragged and thrown with the mouse, like the avatar. They bounce off the walls and can land on the bed.
 //   While the mouse holds the avatar, his free hands go for a target (the nearest disk, or the bed if he is sleepy):
 //     held in the air          -> the free hands reach out for it
@@ -41,6 +43,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <functional>
  
 // ----------------------------------------------------------------------------
 // Template data
@@ -106,6 +109,14 @@ struct PoseTweak {
     float   rHandAtW  = 0.0f;                    // ...and how strongly it is pulled there (0..1)
     float   rToMouth  = 0.0f;                    // 0..1: then pulled on up to the mouth
     float   rBendDown = 0.0f;                    // 0..1: right elbow points out/down instead of back
+    // Pain: one hand goes to the spot on his body that was hit and rubs it
+    int     painA = -1, painB = -1;              // the bone the spot is on...
+    float   painSeg = 0.0f;                      // ...and how far along it (0..1)
+    Vector3 painDir = {0, 0, 0};                 // world direction from the bone to the contact point
+    float   painRadius = 0.0f;                   // how far out (the body surface)
+    int     painHand = 0;                        // 0 = left hand, 1 = right hand
+    float   painBlend = 0.0f;                    // 0..1
+    float   painClock = 0.0f;                    // drives the rubbing
 };
  
 // Timing (seconds)
@@ -229,6 +240,12 @@ static void PushOutOfBox(Vector3& p, float r, const Box& b) {
     else               p.z = b.max.z + r;
 }
  
+// A sphere on his body that bricks can hit: the point a + t*(b - a) of a bone, with a radius.
+struct Probe { int a, b; float t; float r; int armSide; };    // armSide: 0 = left arm, 1 = right arm, -1 = elsewhere
+ 
+static const float PAIN_TIME         = 2.0f;    // seconds he rubs the sore spot
+static const float BRICK_HURT_SPEED  = 1.5f;    // closing speed (m/s) below which a brick doesn't hurt
+ 
 struct Stick { int a, b; float lo, hi; };   // allowed length range [lo, hi]
  
 struct Ragdoll {
@@ -248,6 +265,17 @@ struct Ragdoll {
     // Collision tracking (feeds the mood bar). The game loop reads and clears pendingMoodHit.
     float pendingMoodHit = 0.0f;           // mood points lost to collisions since last read
     float impactCooldown = 0.0f;           // merges the many contacts of one fall into one collision
+ 
+    // Pain from being hit by a brick
+    float painTimer = 0.0f;                // seconds left of the pain reaction
+    float painBlend = 0.0f;                // 0..1 ease in/out of the hand-to-spot pose (while on his feet)
+    int   painA = 0, painB = 0;            // bone the sore spot is on
+    float painSeg = 0.0f;                  // position along that bone
+    Vector3 painDir = {0, 0, 0};           // world direction from the bone to where the brick touched
+    float painRadius = 0.0f;
+    int   painHand = 0;                    // which hand rubs it (0 = left)
+    float brickHitCooldown = 0.0f;         // one hit at a time
+    std::function<void(Vector3&)> adjustOrigin;   // lets the game loop move his get-up spot to somewhere free
  
     // Bed interaction
     float bedTimer = 0.0f;                 // time spent lying still on the mattress
@@ -411,6 +439,22 @@ struct Ragdoll {
         loc[L_ELB]  = TwoBone(loc[L_SHO], loc[L_HAND], Bone(L_SHO, L_ELB),  Bone(L_ELB, L_HAND),  bendL);
         loc[R_ELB]  = TwoBone(loc[R_SHO], loc[R_HAND], Bone(R_SHO, R_ELB),  Bone(R_ELB, R_HAND),  bendR);
  
+        if (tw && tw->painBlend > 0.0f && tw->painA >= 0) {      // ouch: a hand to the sore spot, rubbing it
+            Vector3 spot = Vector3Lerp(loc[tw->painA], loc[tw->painB], tw->painSeg);
+            const Vector3 dl = {tw->painDir.x * cy - tw->painDir.z * sy, tw->painDir.y,       // contact direction, world -> his frame
+                                tw->painDir.x * sy + tw->painDir.z * cy};
+            spot = Vector3Add(spot, Vector3Scale(dl, tw->painRadius));
+            const float rub = tw->painClock * 2.0f * PI * 3.0f;
+            spot.x += 0.012f * H * std::cos(rub);
+            spot.y += 0.012f * H * std::sin(rub);
+            const bool left = (tw->painHand == 0);
+            const int hnd = left ? L_HAND : R_HAND, sho = left ? L_SHO : R_SHO, elb = left ? L_ELB : R_ELB;
+            Vector3 target = Vector3Lerp(loc[hnd], spot, tw->painBlend);
+            const Vector3 bend = Vector3Lerp(back, {left ? 0.4f : -0.4f, -1.0f, 0.1f}, tw->painBlend);
+            loc[elb] = TwoBone(loc[sho], target, Bone(sho, elb), Bone(elb, hnd), bend);
+            loc[hnd] = target;
+        }
+ 
         for (int j = 0; j < JOINT_COUNT; j++) {
             out[j] = {org.x + loc[j].x * cy + loc[j].z * sy,
                       loc[j].y,
@@ -427,7 +471,7 @@ struct Ragdoll {
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
  
-    void HardReset() { origin = {0.0f, 0.0f, 0.0f}; yaw = 0.0f; Stand(); }
+    void HardReset() { origin = {0.0f, 0.0f, 0.0f}; yaw = 0.0f; painTimer = 0.0f; painBlend = 0.0f; Stand(); }
  
     // Switch to physics. `push` gives the upper body a shove so it topples.
     void GoLimp(bool push) {
@@ -452,6 +496,7 @@ struct Ragdoll {
         Vector3 up, fwd;
         BodyFrame(up, fwd);
         origin = {pos[PELVIS].x, 0.0f, pos[PELVIS].z};
+        if (adjustOrigin) adjustOrigin(origin);                       // not inside a pile of bricks
  
         float fl = std::sqrt(fwd.x * fwd.x + fwd.z * fwd.z);
         float fx, fz;
@@ -581,6 +626,13 @@ struct Ragdoll {
         }
  
         if (grabbed >= 0 && !asleep && hasTarget) ActiveHold(dt);      // held by the mouse: hands crawl / reach
+        if (painTimer > 0.0f && !asleep && grabbed < 0) {              // hurt: a hand clutches the sore spot
+            const int hnd = painHand == 0 ? L_HAND : R_HAND;
+            Vector3 spot = Vector3Add(Vector3Lerp(pos[painA], pos[painB], painSeg), Vector3Scale(painDir, painRadius));
+            const float rub = painTimer * 2.0f * PI * 3.0f;
+            spot.x += 0.02f * std::cos(rub); spot.z += 0.02f * std::sin(rub);
+            PullJoint(hnd, spot, 0.12f);
+        }
  
         // Collision detection: how fast is any joint about to hit the floor or a wall?
         impactCooldown -= dt;
@@ -625,8 +677,13 @@ struct Ragdoll {
         }
  
         // Fall detection: pelvis near the floor and nobody holding the avatar
-        if (!passedOut && grabbed < 0 && pos[PELVIS].y < 0.20f * look.height) groundTimer += dt;
-        else groundTimer = 0.0f;
+        {
+            Vector3 bUp, bFwd; BodyFrame(bUp, bFwd);
+            const float pelvisSpeed = Vector3Length(Vector3Subtract(pos[PELVIS], prev[PELVIS])) / dt;
+            const bool lyingStill = std::fabs(bUp.y) < 0.6f && pelvisSpeed < 0.3f && !OverBed(pos[PELVIS]);   // e.g. draped over the bricks
+            if (!passedOut && grabbed < 0 && (pos[PELVIS].y < 0.20f * look.height || lyingStill)) groundTimer += dt;
+            else groundTimer = 0.0f;
+        }
         if (groundTimer >= FALL_WAIT) BeginGetUp();
     }
  
@@ -890,6 +947,15 @@ struct Ragdoll {
             k.pelvisY -= cb * 0.012f;
             tw.coverFace = cb;
         }
+        if (painBlend > 0.0f) {                                      // hunch over the sore spot: more the lower it is
+            const Vector3 spotRest = Vector3Lerp(rest[painA], rest[painB], painSeg);
+            const float low = Clamp((0.70f - spotRest.y / look.height) / 0.45f, 0.0f, 1.0f);   // 0 = head/shoulders .. 1 = knee/shin
+            k.lean    += painBlend * (6.0f + 58.0f * low);          // (low spots: a deep crouch so the hand can reach)
+            k.pelvisY -= painBlend * (0.01f + 0.29f * low);
+            tw.painA = painA; tw.painB = painB; tw.painSeg = painSeg;
+            tw.painDir = painDir; tw.painRadius = painRadius; tw.painHand = painHand;
+            tw.painBlend = painBlend; tw.painClock = emoteClock;
+        }
         return yawOff;
     }
  
@@ -902,7 +968,48 @@ struct Ragdoll {
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
  
+    // Called when a brick hits him: lose mood, and put a hand to the spot as if it hurts.
+    void RegisterHit(const Probe& pr, Vector3 towardBrick, float loss) {
+        pendingMoodHit += loss;
+        painA = pr.a; painB = pr.b; painSeg = pr.t;
+        painDir = towardBrick; painRadius = pr.r;
+        painTimer = PAIN_TIME;
+        const Vector3 spotRest = Vector3Lerp(rest[pr.a], rest[pr.b], pr.t);
+        painHand = (spotRest.x >= 0.0f) ? 0 : 1;                      // the hand on that side...
+        if (pr.armSide >= 0) painHand = 1 - pr.armSide;               // ...or the other hand, if the arm itself was hit
+        danceT = 0.0f;
+    }
+ 
+    // The probes along his body that bricks can hit (joints plus points along the bones).
+    int BodyProbes(Probe out[]) const {
+        const float H = look.height, b = look.build, sq = std::sqrt(b);
+        int n = 0;
+        auto add = [&](int a, int c, float t, float r, int arm) { out[n++] = {a, c, t, r, arm}; };
+        add(HEAD, HEAD, 0.0f, 0.065f * H, -1);
+        for (float t : {0.0f, 0.33f, 0.66f, 1.0f}) add(NECK, PELVIS, t, 0.07f * H * b, -1);     // torso
+        add(L_SHO, L_SHO, 0.0f, 0.045f * H * sq, -1);  add(R_SHO, R_SHO, 0.0f, 0.045f * H * sq, -1);
+        add(L_HIP, L_HIP, 0.0f, 0.050f * H * sq, -1);  add(R_HIP, R_HIP, 0.0f, 0.050f * H * sq, -1);
+        const int sho[2] = {L_SHO, R_SHO}, elb[2] = {L_ELB, R_ELB}, han[2] = {L_HAND, R_HAND};
+        const int hip[2] = {L_HIP, R_HIP}, kne[2] = {L_KNEE, R_KNEE}, foo[2] = {L_FOOT, R_FOOT};
+        for (int k = 0; k < 2; k++) {
+            add(sho[k], elb[k], 0.5f, 0.030f * H * sq, k);  add(elb[k], elb[k], 0.0f, 0.030f * H * sq, k);   // arm
+            add(elb[k], han[k], 0.5f, 0.026f * H * sq, k);  add(han[k], han[k], 0.0f, 0.032f * H, k);
+            add(hip[k], kne[k], 0.35f, 0.045f * H * sq, -1); add(hip[k], kne[k], 0.70f, 0.045f * H * sq, -1);   // leg
+            add(kne[k], kne[k], 0.0f, 0.040f * H * sq, -1);
+            add(kne[k], foo[k], 0.35f, 0.035f * H * sq, -1); add(kne[k], foo[k], 0.70f, 0.035f * H * sq, -1);
+            add(foo[k], foo[k], 0.0f, 0.040f * H, -1);
+        }
+        return n;
+    }
+ 
     void Step(float dt) {
+        // pain timers (shared by every mode)
+        if (painTimer > 0.0f) painTimer -= dt;
+        brickHitCooldown -= dt;
+        const bool onFeet = (mode == MODE_STANDING || mode == MODE_WALK || mode == MODE_FETCH);
+        const float pTarget = (painTimer > 0.0f && onFeet) ? 1.0f : 0.0f;
+        painBlend += Clamp(pTarget - painBlend, -(pTarget > painBlend ? 8.0f : 3.0f) * dt, (pTarget > painBlend ? 8.0f : 3.0f) * dt);
+ 
         if (mode == MODE_STANDING) StepStanding(dt);
         else if (mode == MODE_RAGDOLL) StepRagdoll(dt);
         else if (mode == MODE_GETUP) StepGetUp(dt);
@@ -1163,6 +1270,170 @@ static void StepBricks(std::vector<Brick>& bricks, float frameDt) {
     }
 }
  
+// Somewhere he can stand: inside the arena, clear of the bed and of every brick (with room around him).
+static bool SpotIsFree(const std::vector<Brick>& bricks, Vector3 p) {
+    if (std::fabs(p.x) > ARENA - 0.5f || std::fabs(p.z) > ARENA - 0.5f) return false;
+    if (p.x > BED.min.x - 0.4f && p.z > BED.min.z - 0.4f) return false;
+    for (const Brick& b : bricks) {
+        if (b.state == BRICK_DRAGGED) continue;
+        if (std::fabs(p.x - b.pos.x) < BRICK_HALF.x + 0.45f && std::fabs(p.z - b.pos.z) < BRICK_HALF.z + 0.45f) return false;
+    }
+    return true;
+}
+static void ClearOfBricks(const std::vector<Brick>& bricks, Vector3& o) {
+    if (SpotIsFree(bricks, o)) return;
+    for (float r = 0.3f; r < 5.0f; r += 0.3f)                                  // spiral outwards to the nearest free spot
+        for (int k = 0; k < 16; k++) {
+            const float a = k * 2.0f * PI / 16.0f;
+            const Vector3 c = {o.x + std::cos(a) * r, 0.0f, o.z + std::sin(a) * r};
+            if (SpotIsFree(bricks, c)) { o = c; return; }
+        }
+}
+ 
+// Is point e inside any brick other than `self`?
+static bool InsideOtherBrick(const std::vector<Brick>& bricks, const Brick* self, Vector3 e) {
+    for (const Brick& o : bricks) {
+        if (&o == self || o.state == BRICK_DRAGGED) continue;
+        if (std::fabs(e.x - o.pos.x) < BRICK_HALF.x && std::fabs(e.y - o.pos.y) < BRICK_HALF.y && std::fabs(e.z - o.pos.z) < BRICK_HALF.z) return true;
+    }
+    return false;
+}
+ 
+// A sphere centre p (radius r) is inside brick `self`: which way is out? Prefer a face the sphere is moving away from
+// (rel = its velocity relative to the brick), and never one that leads into a neighbouring brick or the floor.
+static void ExitThroughFace(const std::vector<Brick>& bricks, const Brick& self, Vector3 p, float r, Vector3 rel, Vector3& n, float& depth) {
+    const Box bx = BrickBox(self);
+    const float f[6] = {p.x - bx.min.x, bx.max.x - p.x, p.y - bx.min.y, bx.max.y - p.y, p.z - bx.min.z, bx.max.z - p.z};
+    const Vector3 dirs[6] = {{-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
+    bool open[6];
+    for (int m = 0; m < 6; m++) {
+        const Vector3 e = Vector3Add(p, Vector3Scale(dirs[m], f[m] + 0.5f * r));       // where the sphere would end up
+        open[m] = e.y > 0.0f && !InsideOtherBrick(bricks, &self, e);
+    }
+    int k = -1;
+    for (int m = 0; m < 6; m++)                                                          // 1st choice: open and against its motion
+        if (open[m] && Vector3DotProduct(dirs[m], rel) <= 0.0f && (k < 0 || f[m] < f[k])) k = m;
+    if (k < 0) for (int m = 0; m < 6; m++) if (open[m] && (k < 0 || f[m] < f[k])) k = m;           // 2nd: any open face
+    if (k < 0) { k = 0; for (int m = 1; m < 6; m++) if (f[m] < f[k]) k = m; }                       // 3rd: simply the nearest
+    n = dirs[k]; depth = f[k] + r;
+}
+ 
+// Bricks versus his body. Run once per frame after the bricks have moved.
+//  - While he is posed by an animation (standing, walking, ...) he cannot be pushed: a falling brick bounces off him
+//    (and slides off if it lands on top). While he is a ragdoll (or held) the brick pushes his body parts instead.
+//  - A brick that hits fast enough hurts: mood is lost and he puts a hand to the spot (see Ragdoll::RegisterHit).
+//  jointVel = how fast each of his joints moved this frame (m/s).
+static void ResolveAvatarBricks(Ragdoll& av, std::vector<Brick>& bricks, const Vector3 jointVel[JOINT_COUNT], float frameDt) {
+    // posed = driven by an animation that cannot be shoved (a ragdoll or a get-up can be pushed)
+    const bool posed = (av.mode == MODE_STANDING || av.mode == MODE_WALK || av.mode == MODE_BEDANIM || av.mode == MODE_FETCH || av.mode == MODE_EAT);
+    Probe probes[48];
+    const int np = av.BodyProbes(probes);
+ 
+    float bestClosing = 0.0f; int bestProbe = -1; Vector3 bestToward = {0, 0, 0};
+    for (Brick& br : bricks) {
+        if (Vector3Distance(br.pos, av.pos[PELVIS]) > 2.5f) continue;                  // far away: skip
+        const Box bx = BrickBox(br);
+        for (int i = 0; i < np; i++) {
+            const Probe& pr = probes[i];
+            const Vector3 p = Vector3Lerp(av.pos[pr.a], av.pos[pr.b], pr.t);
+            const Vector3 q = {Clamp(p.x, bx.min.x, bx.max.x), Clamp(p.y, bx.min.y, bx.max.y), Clamp(p.z, bx.min.z, bx.max.z)};
+            const Vector3 d = Vector3Subtract(p, q);
+            const float dist = Vector3Length(d);
+            if (dist >= pr.r) continue;                                                  // not touching
+ 
+            const Vector3 vProbe = Vector3Lerp(jointVel[pr.a], jointVel[pr.b], pr.t);
+            const Vector3 vBrick = br.state == BRICK_RESTING ? Vector3{0, 0, 0} : br.vel;
+ 
+            Vector3 n; float depth;                                                      // n: from the brick toward the probe
+            if (dist > 1e-5f) { n = Vector3Scale(d, 1.0f / dist); depth = pr.r - dist; }
+            else ExitThroughFace(bricks, br, p, pr.r, Vector3Subtract(vProbe, vBrick), n, depth);   // centre inside the brick
+ 
+            const float closing = Vector3DotProduct(Vector3Subtract(vBrick, vProbe), n);   // > 0: they are coming together
+            if (posed && br.state == BRICK_RESTING) continue;                              // he walked into a resting brick: ignore
+ 
+            if (closing > bestClosing) {
+                bestClosing = closing; bestProbe = i; bestToward = Vector3Scale(n, -1.0f);   // toward the brick
+            }
+ 
+            const bool fromAbove = (n.y < -0.5f);                                           // the brick is on top of that part
+            if (br.state == BRICK_DRAGGED) {
+                if (posed) continue;                                                        // the mouse drags it through him
+            }
+            if (posed || (fromAbove && br.state == BRICK_FALLING)) {
+                // he doesn't move: the brick is pushed out (and rebounds a little, or slides off)
+                if (br.state == BRICK_FALLING) {
+                    br.pos = Vector3Subtract(br.pos, Vector3Scale(n, depth));
+                    if (closing > 0.0f) br.vel = Vector3Subtract(br.vel, Vector3Scale(n, closing * 1.3f));
+                    if (fromAbove) {
+                        br.vel.y = std::max(br.vel.y, 0.0f);
+                        Vector3 away = {br.pos.x - av.pos[PELVIS].x, 0.0f, br.pos.z - av.pos[PELVIS].z};
+                        const float al = Vector3Length(away);
+                        away = al > 1e-4f ? Vector3Scale(away, 1.0f / al) : Vector3{1, 0, 0};
+                        br.vel.x += away.x * 4.0f * frameDt;  br.vel.z += away.z * 4.0f * frameDt;   // slide off his head/shoulder
+                    }
+                }
+            } else {
+                // ragdoll: the brick pushes his body parts out of the way and gives them some of its momentum
+                const float wa = (1.0f - pr.t), wb = pr.t;
+                const float norm = (pr.a == pr.b) ? 1.0f : 1.0f / (wa * wa + wb * wb);
+                const int ends[2] = {pr.a, pr.b};
+                const float ws[2] = {(pr.a == pr.b) ? 1.0f : wa, (pr.a == pr.b) ? 0.0f : wb};
+                for (int e = 0; e < 2; e++) {
+                    const int j = ends[e];
+                    if (ws[e] <= 0.0f || av.Pinned(j)) continue;
+                    av.pos[j] = Vector3Add(av.pos[j], Vector3Scale(n, depth * ws[e] * norm));
+                    if (closing > 0.0f && br.state != BRICK_RESTING)
+                        av.prev[j] = Vector3Subtract(av.prev[j], Vector3Scale(n, closing * 0.5f * DT * ws[e]));   // shove
+                }
+                if (closing > 0.0f && br.state == BRICK_FALLING)
+                    br.vel = Vector3Subtract(br.vel, Vector3Scale(n, closing * 0.3f));                          // the brick slows
+            }
+        }
+    }
+ 
+    // Clean-up (ragdoll only): a part pushed out of one brick can land inside its neighbour; sort that out against the pile.
+    if (!posed) {
+        for (int pass = 0; pass < 3; pass++) {
+            bool any = false;
+            for (Brick& br : bricks) {
+                if (br.state != BRICK_RESTING || Vector3Distance(br.pos, av.pos[PELVIS]) > 2.5f) continue;
+                const Box bx = BrickBox(br);
+                for (int i = 0; i < np; i++) {
+                    const Probe& pr = probes[i];
+                    const Vector3 p = Vector3Lerp(av.pos[pr.a], av.pos[pr.b], pr.t);
+                    const Vector3 q = {Clamp(p.x, bx.min.x, bx.max.x), Clamp(p.y, bx.min.y, bx.max.y), Clamp(p.z, bx.min.z, bx.max.z)};
+                    const Vector3 d = Vector3Subtract(p, q);
+                    const float dist = Vector3Length(d);
+                    if (dist >= pr.r - 1e-4f) continue;
+                    Vector3 n; float depth;
+                    if (dist > 1e-5f) { n = Vector3Scale(d, 1.0f / dist); depth = pr.r - dist; }
+                    else ExitThroughFace(bricks, br, p, pr.r, {0, 0, 0}, n, depth);
+                    const float wa = (1.0f - pr.t), wb = pr.t;
+                    const float norm = (pr.a == pr.b) ? 1.0f : 1.0f / (wa * wa + wb * wb);
+                    const int ends[2] = {pr.a, pr.b};
+                    const float ws[2] = {(pr.a == pr.b) ? 1.0f : wa, (pr.a == pr.b) ? 0.0f : wb};
+                    for (int e = 0; e < 2; e++) {
+                        if (ws[e] <= 0.0f || av.Pinned(ends[e])) continue;
+                        av.pos[ends[e]] = Vector3Add(av.pos[ends[e]], Vector3Scale(n, depth * ws[e] * norm));
+                        any = true;
+                    }
+                }
+            }
+            if (!any) break;
+        }
+    }
+ 
+    // One hurtful hit at a time: the hardest contact this frame
+    if (bestProbe >= 0 && bestClosing > BRICK_HURT_SPEED && av.brickHitCooldown <= 0.0f && !av.asleep) {
+        const float loss = std::min(4.0f + 3.0f * (bestClosing - BRICK_HURT_SPEED), 30.0f);
+        av.RegisterHit(probes[bestProbe], bestToward, loss);
+        av.brickHitCooldown = 0.5f;
+    } else if (bestProbe >= 0 && bestClosing > BRICK_HURT_SPEED && av.asleep && av.brickHitCooldown <= 0.0f) {
+        av.pendingMoodHit += std::min(4.0f + 3.0f * (bestClosing - BRICK_HURT_SPEED), 30.0f);     // asleep: it still hurts, but no reaction
+        av.brickHitCooldown = 0.5f;
+    }
+}
+ 
 static void DrawBrick(const Brick& b) {
     Color c = b.color;
     if (b.state == BRICK_DRAGGED) c = {(unsigned char)std::min(255, c.r + 45), (unsigned char)std::min(255, c.g + 45), (unsigned char)std::min(255, c.b + 45), 255};
@@ -1202,6 +1473,8 @@ int main() {
     float sleepiness = 100.0f;              // 100 = rested (light blue), 0 = exhausted (dark blue)
     float sleepTick = 0.0f;                 // counts up to SLEEP_INTERVAL, then sleepiness drops
     Vector3 focus = {0.0f, 0.0f, 0.0f};     // camera follows the avatar on the ground plane
+    Vector3 lastAvatarPos[JOINT_COUNT];     // for estimating how fast his joints move
+    for (int i = 0; i < JOINT_COUNT; i++) lastAvatarPos[i] = avatar.pos[i];
  
     // Food: disks dropped with the button. He eats them one at a time (oldest first).
     std::vector<Food> foods;
@@ -1209,6 +1482,7 @@ int main() {
     int grabbedFood = -1;                   // index of the disk the mouse is holding, or -1
     std::vector<Brick> bricks = MakePile(); // the brick pile (opposite corner from the bed)
     int grabbedBrick = -1;                  // index of the brick the mouse is holding, or -1
+    avatar.adjustOrigin = [&](Vector3& o) { ClearOfBricks(bricks, o); };   // he never gets up inside the pile
     float brickGrabDist = 0.0f;
     float foodGrabDist = 0.0f;
     float zeroSleepTimer = 0.0f;            // seconds spent at zero sleepiness
@@ -1469,6 +1743,17 @@ int main() {
         }
  
         StepBricks(bricks, GetFrameTime());
+        {                                                               // bricks hurt: collide with his body
+            Vector3 avatarVel[JOINT_COUNT];
+            const float fdt = std::max(GetFrameTime(), 1e-4f);
+            for (int i = 0; i < JOINT_COUNT; i++) {
+                Vector3 v = Vector3Scale(Vector3Subtract(avatar.pos[i], lastAvatarPos[i]), 1.0f / fdt);
+                const float vl = Vector3Length(v);
+                avatarVel[i] = vl > 12.0f ? Vector3Scale(v, 12.0f / vl) : v;
+                lastAvatarPos[i] = avatar.pos[i];
+            }
+            ResolveAvatarBricks(avatar, bricks, avatarVel, fdt);
+        }
  
         // Tired enough (and on his feet)? Walk to the bed.
         if (avatar.mode == MODE_STANDING && sleepiness <= SLEEPY_AT && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f)
@@ -1494,7 +1779,8 @@ int main() {
         DrawText("SPACE knock over   R reset   drag avatar joint / drag empty space = turn camera   Wheel zoom", 12, sh - 54, 18, DARKGRAY);
         DrawText("LEFT/RIGHT build   K skin  H hair  C shirt  P pants   B/M/N mood   Z sleepy   X exhausted   (height keys off)", 12, sh - 30, 18, DARKGRAY);
         const char* state = "STANDING";
-        if (avatar.mode == MODE_STANDING && avatar.danceT > 0.0f) state = "DANCING";
+        if (avatar.mode == MODE_STANDING && avatar.painBlend > 0.5f) state = "OUCH!";
+        else if (avatar.mode == MODE_STANDING && avatar.danceT > 0.0f) state = "DANCING";
         else if (avatar.mode == MODE_STANDING && avatar.cryBlend > 0.5f) state = "CRYING";
         if (avatar.mode == MODE_GETUP) state = "GETTING UP";
         else if (avatar.mode == MODE_WALK) state = "WALKING TO BED";
@@ -1523,3 +1809,4 @@ int main() {
     CloseWindow();
     return 0;
 }
+ 
