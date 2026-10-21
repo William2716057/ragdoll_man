@@ -16,7 +16,9 @@
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
 //   Screen on the -Z wall at his eye level, as wide as he is tall. Click it to switch it on / off. It plays screen.gif
 //   (next to the program, or pass a path as the first argument) at a fixed 10 frames/s; until then a test pattern.
-//   An Entertainment bar (placeholder for now) sits under Sleepiness.
+//   Click the wall panel just BELOW the screen: he walks to a spot in front of it, sits on the floor and watches.
+//   Entertainment drains slowly; while he sits watching with the screen ON it refills slowly; with the screen OFF it
+//   does not. He gets up when entertained (100), sleepy, when there is food on the floor, or after 8 s of a dead screen.
 //   Brick pile (5 wide x 8 long x 4 high) in the corner opposite the bed: pick up, drag and throw them with the mouse.
 //   Lift one out and whatever rested on it falls; they stack and slide. Bricks collide with the avatar: a hard enough hit
 //   costs mood and he puts a hand to the spot and rubs it (higher spot = stands tall, lower = hunches over). A ragdoll
@@ -43,12 +45,23 @@
  
 #include "raylib.h"
 #include "rlgl.h"          // for drawing the textured screen
+ 
+// raylib 5.5 renamed GetMouseRay to GetScreenToWorldRay (and the old name was dropped in 6.x), so pick the right one.
+#if defined(RAYLIB_VERSION_MAJOR) && (RAYLIB_VERSION_MAJOR > 5 || (RAYLIB_VERSION_MAJOR == 5 && RAYLIB_VERSION_MINOR >= 5))
+  #define RAYLIB_HAS_SCREEN_TO_WORLD_RAY 1
+#endif
 #include "raymath.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <functional>
 #include <cstring>
+ 
+#ifdef RAYLIB_HAS_SCREEN_TO_WORLD_RAY
+static inline Ray ScreenRay(Vector2 p, Camera3D c) { return GetScreenToWorldRay(p, c); }
+#else
+static inline Ray ScreenRay(Vector2 p, Camera3D c) { return GetMouseRay(p, c); }
+#endif
  
 // ----------------------------------------------------------------------------
 // Template data
@@ -61,7 +74,8 @@ enum Joint {
     JOINT_COUNT
 };
  
-enum Mode { MODE_STANDING, MODE_RAGDOLL, MODE_GETUP, MODE_WALK, MODE_BEDANIM, MODE_FETCH, MODE_EAT };
+enum Mode { MODE_STANDING, MODE_RAGDOLL, MODE_GETUP, MODE_WALK, MODE_BEDANIM, MODE_FETCH, MODE_EAT, MODE_TV };
+enum TvStage { TV_WALK, TV_SIT, TV_WATCH, TV_RISE };   // within MODE_TV
  
 struct Appearance {
     float height = 1.75f;   // metres
@@ -95,6 +109,10 @@ static const PoseKey KEY_STAND  = {0.515f, 0.00f,  0.0f, 0.06f, 0.04f, 0.00f, 0.
 // Eating: deep crouch to pick a disk off the floor (right hand is steered separately), then upright with a slight bow
 static const PoseKey KEY_PICK   = {0.170f, -0.10f, 66.0f, 0.07f, 0.04f, 0.02f, 0.145f, 0.12f, 0.15f};
 static const PoseKey KEY_MOUTH  = {0.515f, 0.00f,  6.0f, 0.06f, 0.04f, 0.00f, 0.145f, 0.52f, 0.03f};
+// Sitting on the floor to watch TV: knees up, feet flat in front, hands resting on the knees, leaning back a little.
+// (The pelvis ends up behind where he stood, so the feet stay roughly where they were.)
+static const PoseKey KEY_SIT_MID = {0.240f, -0.12f, 22.0f, 0.07f, 0.04f, 0.04f, 0.12f, 0.36f, 0.00f};
+static const PoseKey KEY_SIT     = {0.070f, -0.22f, -6.0f, 0.10f, 0.03f, 0.06f, 0.10f, 0.31f, -0.05f};
  
 static PoseKey KeyLerp(const PoseKey& a, const PoseKey& b, float t) {
     PoseKey r;
@@ -224,6 +242,13 @@ static bool SegmentHitsBed(Vector3 a, Vector3 b, float margin) {
 enum FoodState { FOOD_FALLING, FOOD_LANDED, FOOD_TARGETED, FOOD_DRAGGED };
 struct Food { Vector3 pos; Vector3 vel; int state; };   // pos = centre of the disk
  
+// Entertainment: drains slowly; refills only while he sits watching the TV with the screen switched on
+static const float ENT_DROP        = 1.0f;      // points lost per tick...
+static const float ENT_INTERVAL    = 2.0f;      // ...every this many seconds
+static const float ENT_REGEN       = 2.0f;      // points per second gained while watching (screen on)
+static const float TV_DISTANCE     = 2.8f;      // how far from the wall he stands before sitting down (m)
+static const float TV_SIT_T        = 1.8f;      // seconds to sit down (and to get back up)
+static const float TV_OFF_PATIENCE = 8.0f;      // seconds he keeps staring at a switched-off screen before giving up
 static const float PASS_OUT_AFTER = 10.0f;  // seconds at zero sleepiness before he collapses and sleeps where he stands
 static const float FETCH_STOP = 0.34f;      // how far from the food he stops before crouching (m)
 static const bool  HEIGHT_KEYS = false;     // the height keys are switched off for now
@@ -307,6 +332,12 @@ struct Ragdoll {
     Vector3 foodPos = {0, 0, 0};               // where the held disk is (read by the game loop)
     bool    foodEaten = false;                 // set when the disk has been eaten (game loop clears it)
  
+    // Watching TV
+    Vector3 tvSpot = {0, 0, 0};                // where he stands (facing the screen) before sitting down
+    int     tvStage = TV_WALK;
+    float   tvT = 0.0f;                        // sit-down / get-up progress, or time spent watching
+    bool    tvRiseRequested = false;           // the game loop asks him to get up (he finishes sitting down first)
+ 
     // Emotes (set moodLevel from the game loop each frame)
     float moodLevel   = 100.0f;
     float danceT      = 0.0f;                  // seconds of the current dance left (0 = not dancing)
@@ -321,7 +352,7 @@ struct Ragdoll {
     bool  cryBurstDone = false;                // already cried this window
     bool  asleep   = false;
  
-    bool  Pinned(int i) const { return mode == MODE_STANDING || mode == MODE_WALK || mode == MODE_BEDANIM || mode == MODE_FETCH || mode == MODE_EAT || i == grabbed; }
+    bool  Pinned(int i) const { return mode == MODE_STANDING || mode == MODE_WALK || mode == MODE_BEDANIM || mode == MODE_FETCH || mode == MODE_EAT || mode == MODE_TV || i == grabbed; }
     float Radius(int j) const { return (j == HEAD ? 0.065f : 0.03f) * look.height; }
     float Bone(int a, int b) const { return Vector3Distance(rest[a], rest[b]); }
  
@@ -410,7 +441,7 @@ struct Ragdoll {
             loc[R_HAND].z += sL * 0.09f * H * gaitStrength;
         }
  
-        const Vector3 fwd = {0.0f, 0.0f, 1.0f}, back = {0.0f, 0.0f, -1.0f};
+        const Vector3 back = {0.0f, 0.0f, -1.0f};
         Vector3 bendL = back, bendR = back;               // which way the elbows point
         if (tw) {
             loc[L_HAND] = Vector3Add(loc[L_HAND], Vector3Scale(tw->lHand, H));
@@ -439,8 +470,10 @@ struct Ragdoll {
             }
             if (tw->rBendDown > 0.0f) bendR = Vector3Lerp(bendR, {-0.4f, -1.0f, 0.1f}, tw->rBendDown);
         }
-        loc[L_KNEE] = TwoBone(loc[L_HIP], loc[L_FOOT], Bone(L_HIP, L_KNEE), Bone(L_KNEE, L_FOOT), fwd);
-        loc[R_KNEE] = TwoBone(loc[R_HIP], loc[R_FOOT], Bone(R_HIP, R_KNEE), Bone(R_KNEE, R_FOOT), fwd);
+        // Knees point forward when the leg is vertical and UP when it is horizontal (sitting, lying), slightly outward.
+        const Vector3 kneeL = {+0.12f, 1.0f, 1.0f}, kneeR = {-0.12f, 1.0f, 1.0f};
+        loc[L_KNEE] = TwoBone(loc[L_HIP], loc[L_FOOT], Bone(L_HIP, L_KNEE), Bone(L_KNEE, L_FOOT), kneeL);
+        loc[R_KNEE] = TwoBone(loc[R_HIP], loc[R_FOOT], Bone(R_HIP, R_KNEE), Bone(R_KNEE, R_FOOT), kneeR);
         loc[L_ELB]  = TwoBone(loc[L_SHO], loc[L_HAND], Bone(L_SHO, L_ELB),  Bone(L_ELB, L_HAND),  bendL);
         loc[R_ELB]  = TwoBone(loc[R_SHO], loc[R_HAND], Bone(R_SHO, R_ELB),  Bone(R_ELB, R_HAND),  bendR);
  
@@ -471,7 +504,7 @@ struct Ragdoll {
     void Stand() {
         mode = MODE_STANDING; grabbed = -1; groundTimer = 0.0f; getupT = 0.0f;
         bedTimer = 0.0f; asleep = false; passedOut = false; walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f; bedT = 0.0f; bedReverse = false;
-        foodHeld = false; danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; cryWindowT = 0.0f; cryBurstT = 0.0f; cryBurstDone = false; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
+        foodHeld = false; tvRiseRequested = false; danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; cryWindowT = 0.0f; cryBurstT = 0.0f; cryBurstDone = false; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
         ComputePose(KEY_STAND, origin, yaw, pos);
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
@@ -481,7 +514,7 @@ struct Ragdoll {
     // Switch to physics. `push` gives the upper body a shove so it topples.
     void GoLimp(bool push) {
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
-        mode = MODE_RAGDOLL; groundTimer = 0.0f; getupT = 0.0f; bedReverse = false;
+        mode = MODE_RAGDOLL; groundTimer = 0.0f; getupT = 0.0f; bedReverse = false; tvRiseRequested = false;
         if (push) {
             float a = (float)GetRandomValue(0, 628) / 100.0f;
             Vector3 dir = {std::sin(a), 0.0f, std::cos(a)};
@@ -852,6 +885,71 @@ struct Ragdoll {
         if (eatT >= tReturn) Stand();
     }
  
+    // ------------------------------------------------------------------------
+    // Watching TV: walk to a spot facing the screen, sit on the floor, watch, get up again
+    // ------------------------------------------------------------------------
+    void StartWatchTV(Vector3 spot) {
+        mode = MODE_TV; grabbed = -1;
+        tvSpot = spot; tvStage = TV_WALK; tvT = 0.0f; tvRiseRequested = false;
+        walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f;
+        danceT = 0.0f; danceBlend = 0.0f;
+    }
+ 
+    bool Watching() const { return mode == MODE_TV && tvStage == TV_WATCH; }
+ 
+    static PoseKey SeatKey(float p) {                 // 0 = standing .. 1 = sitting on the floor
+        return p < 0.5f ? KeyLerp(KEY_STAND, KEY_SIT_MID, Smooth(p * 2.0f))
+                        : KeyLerp(KEY_SIT_MID, KEY_SIT, Smooth(p * 2.0f - 1.0f));
+    }
+ 
+    void StepTV(float dt) {
+        if (tvStage == TV_WALK) {
+            if (walkStage == 0)   // go round the bed if it is in the way
+                walkStage = SegmentHitsBed(origin, tvSpot, 0.4f) ? 1 : 2;
+            const bool toSpot = (walkStage == 2);
+            const Vector3 goal = toSpot ? tvSpot : CornerSpot();
+            const float dx = goal.x - origin.x, dz = goal.z - origin.z;
+            const float dist = std::sqrt(dx * dx + dz * dz);
+            const float remaining = toSpot ? dist : dist - 0.05f;
+            if (!toSpot && remaining <= 0.003f) { walkStage = 2; return; }          // reached the corner: now the TV spot
+ 
+            if (tvRiseRequested) {                                                  // asked to stop (sleepy, food...): stand still and finish
+                ApplyWalkPose(dt, false, true, true);
+                if (gaitAmp < 0.05f && cryBlend < 0.01f) { tvRiseRequested = false; Stand(); }
+                return;
+            }
+            const bool arrived = remaining <= 0.003f;
+            const float wantYaw = (toSpot && arrived) ? PI : (dist > 1e-4f ? std::atan2(dx, dz) : yaw);   // at the spot: face the screen (-Z)
+            const float dyaw = WrapPi(wantYaw - yaw);
+            const float maxTurn = TURN_RATE * dt;
+            yaw += Clamp(dyaw, -maxTurn, maxTurn);
+            const bool moving = !arrived && std::fabs(dyaw) < 0.6f;
+            if (moving) {
+                const float step = std::min(WALK_SPEED * dt, std::max(remaining, 0.0f));
+                origin.x += std::sin(yaw) * step;
+                origin.z += std::cos(yaw) * step;
+            }
+            ApplyWalkPose(dt, moving, arrived, arrived && toSpot);
+            if (toSpot && arrived && std::fabs(WrapPi(PI - yaw)) < 0.05f && gaitAmp < 0.05f && cryBlend < 0.01f) {
+                origin = tvSpot; yaw = PI;
+                tvStage = TV_SIT; tvT = 0.0f;
+            }
+        } else if (tvStage == TV_SIT || tvStage == TV_RISE) {
+            tvT += (tvStage == TV_SIT) ? dt : -dt;
+            ComputePose(SeatKey(Clamp(tvT / TV_SIT_T, 0.0f, 1.0f)), origin, yaw, pos);
+            for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
+            if (tvStage == TV_SIT && tvT >= TV_SIT_T) { tvStage = TV_WATCH; tvT = 0.0f; }
+            else if (tvStage == TV_RISE && tvT <= 0.0f) Stand();                    // back on his feet, facing the screen
+        } else {                                                                    // TV_WATCH
+            tvT += dt;
+            PoseKey k = KEY_SIT;
+            k.lean += 1.0f * std::sin(2.0f * PI * 0.25f * tvT);                      // gentle sway
+            ComputePose(k, origin, yaw, pos);
+            for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
+            if (tvRiseRequested) { tvRiseRequested = false; tvStage = TV_RISE; tvT = TV_SIT_T; }
+        }
+    }
+ 
     struct BedKey { PoseKey k; float x, z, yaw; };
  
     void StepBedAnim(float dt) {
@@ -1022,6 +1120,7 @@ struct Ragdoll {
         else if (mode == MODE_BEDANIM) StepBedAnim(dt);
         else if (mode == MODE_FETCH) StepFetch(dt);
         else if (mode == MODE_EAT) StepEat(dt);
+        else if (mode == MODE_TV) StepTV(dt);
     }
  
     void Release() {
@@ -1332,7 +1431,7 @@ static void ExitThroughFace(const std::vector<Brick>& bricks, const Brick& self,
 //  jointVel = how fast each of his joints moved this frame (m/s).
 static void ResolveAvatarBricks(Ragdoll& av, std::vector<Brick>& bricks, const Vector3 jointVel[JOINT_COUNT], float frameDt) {
     // posed = driven by an animation that cannot be shoved (a ragdoll or a get-up can be pushed)
-    const bool posed = (av.mode == MODE_STANDING || av.mode == MODE_WALK || av.mode == MODE_BEDANIM || av.mode == MODE_FETCH || av.mode == MODE_EAT);
+    const bool posed = (av.mode == MODE_STANDING || av.mode == MODE_WALK || av.mode == MODE_BEDANIM || av.mode == MODE_FETCH || av.mode == MODE_EAT || av.mode == MODE_TV);
     Probe probes[48];
     const int np = av.BodyProbes(probes);
  
@@ -1539,6 +1638,18 @@ static float ScreenHitDistance(const Ray& ray, const ScreenGeom& g) {
     return t;
 }
  
+// The part of the raised wall panel just below the screen: clicking it sends him to watch TV.
+static float TvBaseHitDistance(const Ray& ray, const ScreenGeom& g) {
+    if (ray.direction.z >= -1e-6f) return -1.0f;
+    const float zFront = -ARENA + SCREEN_PANEL_T;
+    const float t = (zFront - ray.position.z) / ray.direction.z;
+    if (t < 0.0f) return -1.0f;
+    const float x = ray.position.x + ray.direction.x * t, y = ray.position.y + ray.direction.y * t;
+    const float top = g.cy - g.h * 0.5f - 0.06f;                    // just under the bezel
+    if (std::fabs(x - g.cx) > g.panelW * 0.5f || y < 0.0f || y > top) return -1.0f;
+    return t;
+}
+ 
 static void DrawTexturedQuad(Texture2D tex, const ScreenGeom& g) {
     const float x0 = g.cx - g.w * 0.5f, x1 = g.cx + g.w * 0.5f, y0 = g.cy - g.h * 0.5f, y1 = g.cy + g.h * 0.5f;
     rlSetTexture(tex.id);
@@ -1553,7 +1664,7 @@ static void DrawTexturedQuad(Texture2D tex, const ScreenGeom& g) {
     rlSetTexture(0);
 }
  
-static void DrawScreenOnWall(const ScreenMedia& m, const ScreenGeom& g, bool on, bool hover) {
+static void DrawScreenOnWall(const ScreenMedia& m, const ScreenGeom& g, bool on, bool hover, bool baseHover) {
     // the raised section of wall it hangs on
     const Vector3 panelC = {g.cx, g.panelH * 0.5f, -ARENA + SCREEN_PANEL_T * 0.5f};
     DrawCube(panelC, g.panelW, g.panelH, SCREEN_PANEL_T, {206, 200, 188, 255});
@@ -1566,6 +1677,12 @@ static void DrawScreenOnWall(const ScreenMedia& m, const ScreenGeom& g, bool on,
     DrawCube({g.cx + g.w * 0.5f - 0.04f, g.cy - g.h * 0.5f - 0.03f, g.z}, 0.03f, 0.015f, 0.01f,
              on ? Color{70, 230, 100, 255} : Color{210, 50, 50, 255});
     if (hover) DrawCubeWires(bezelC, g.w + 0.12f, g.h + 0.12f, 0.06f, WHITE);
+    if (baseHover) {                                              // the click zone under the screen lights up
+        const float top = g.cy - g.h * 0.5f - 0.06f;
+        const Vector3 c = {g.cx, top * 0.5f, -ARENA + SCREEN_PANEL_T + 0.003f};
+        DrawCube(c, g.panelW - 0.1f, top - 0.05f, 0.004f, {255, 255, 255, 45});
+        DrawCubeWires(c, g.panelW - 0.1f, top - 0.05f, 0.004f, WHITE);
+    }
 }
  
 static void DrawFood(const Food& f, float H) {
@@ -1601,7 +1718,10 @@ int main(int argc, char** argv) {
  
     // Needs (0..100). Health and hunger are placeholders for now; only mood is live.
     float health = 100.0f, hunger = 100.0f, mood = 100.0f;
-    float entertainment = 100.0f;           // placeholder for now (nothing changes it yet)
+    float entertainment = 100.0f;           // drains slowly; refills while he watches the TV with the screen on
+    float entTick = 0.0f;                   // counts up to ENT_INTERVAL, then entertainment drops
+    bool  watchRequested = false;           // the click under the TV is waiting for him to be free
+    float tvOffTimer = 0.0f;                // seconds he has been staring at a switched-off screen
     float moodTick = 0.0f;                  // counts up to MOOD_REGEN_INTERVAL, then mood recovers by 1 point
     float sleepiness = 100.0f;              // 100 = rested (light blue), 0 = exhausted (dark blue)
     float sleepTick = 0.0f;                 // counts up to SLEEP_INTERVAL, then sleepiness drops
@@ -1679,7 +1799,7 @@ int main(int argc, char** argv) {
  
         // ---- pose / physics control ----
         if (IsKeyPressed(KEY_R)) avatar.HardReset();
-        if (IsKeyPressed(KEY_SPACE) && (avatar.mode == MODE_STANDING || avatar.mode == MODE_WALK || avatar.mode == MODE_FETCH || avatar.mode == MODE_EAT)) avatar.GoLimp(true);   // knock over
+        if (IsKeyPressed(KEY_SPACE) && (avatar.mode == MODE_STANDING || avatar.mode == MODE_WALK || avatar.mode == MODE_FETCH || avatar.mode == MODE_EAT || avatar.mode == MODE_TV)) avatar.GoLimp(true);   // knock over
         if (IsKeyPressed(KEY_B)) mood = 5.0f;                                      // test shortcuts: miserable (continuous crying) ...
         if (IsKeyPressed(KEY_M)) mood = 15.0f;                                     // ... sad (occasional 1 s cry) ...
         if (IsKeyPressed(KEY_N)) mood = 100.0f;                                    // ... and happy (dances)
@@ -1689,12 +1809,15 @@ int main(int argc, char** argv) {
         // ---- the screen on the wall: play it, and check whether the mouse is over it ----
         const ScreenGeom sg = ScreenGeometry(avatar.look.height, (float)screen.h / (float)screen.w);
         if (screenOn) { screenClock += GetFrameTime(); UpdateScreenFrame(screen, screenClock); }
-        const float screenDist = ScreenHitDistance(GetMouseRay(GetMousePosition(), cam), sg);
+        const Ray mouseRay = ScreenRay(GetMousePosition(), cam);
+        const float screenDist = ScreenHitDistance(mouseRay, sg);
         const bool screenHover = screenDist >= 0.0f && !overBtn;
+        const float tvBaseDist = TvBaseHitDistance(mouseRay, sg);          // the wall under the screen
+        const bool tvBaseHover = tvBaseDist >= 0.0f && !overBtn && !screenHover;
  
         // ---- mouse grab ----
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiClick) {
-            Ray ray = GetMouseRay(GetMousePosition(), cam);
+            Ray ray = ScreenRay(GetMousePosition(), cam);
             float best = 1e9f; int hit = -1;
             for (int i = 0; i < JOINT_COUNT; i++) {
                 RayCollision c = GetRayCollisionSphere(ray, avatar.pos[i], 0.07f * avatar.look.height);
@@ -1715,6 +1838,8 @@ int main(int argc, char** argv) {
             const bool screenFirst = screenDist >= 0.0f && screenDist < best && screenDist < bestFood && screenDist < bestBrick;
             if (screenFirst) {
                 screenOn = !screenOn;                                    // click the screen: on / off
+            } else if (tvBaseDist >= 0.0f && tvBaseDist < best && tvBaseDist < bestFood && tvBaseDist < bestBrick) {
+                if (!avatar.asleep && avatar.mode != MODE_TV) watchRequested = true;    // click under the TV: go and watch it
             } else if (hitBrick >= 0 && bestBrick < best && bestBrick < bestFood) {   // a brick is the nearest thing under the cursor
                 grabbedBrick = hitBrick; brickGrabDist = bestBrick;
                 bricks[hitBrick].state = BRICK_DRAGGED; bricks[hitBrick].vel = {0.0f, 0.0f, 0.0f};
@@ -1730,7 +1855,7 @@ int main(int argc, char** argv) {
             }
         }
         if (avatar.grabbed >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            Ray ray = GetMouseRay(GetMousePosition(), cam);
+            Ray ray = ScreenRay(GetMousePosition(), cam);
             Vector3 t = Vector3Add(ray.position, Vector3Scale(ray.direction, grabDist));
             const float lim = ARENA - 0.07f * avatar.look.height;       // held joint can't go through walls
             t.x = Clamp(t.x, -lim, lim);
@@ -1741,7 +1866,7 @@ int main(int argc, char** argv) {
             avatar.pos[avatar.grabbed]  = t;
         }
         if (grabbedFood >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            Ray ray = GetMouseRay(GetMousePosition(), cam);
+            Ray ray = ScreenRay(GetMousePosition(), cam);
             Vector3 t = Vector3Add(ray.position, Vector3Scale(ray.direction, foodGrabDist));
             const float lim = ARENA - 0.1f, half = 0.006f * avatar.look.height;
             t.x = Clamp(t.x, -lim, lim); t.z = Clamp(t.z, -lim, lim);
@@ -1753,7 +1878,7 @@ int main(int argc, char** argv) {
             f.pos = t;
         }
         if (grabbedBrick >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            Ray ray = GetMouseRay(GetMousePosition(), cam);
+            Ray ray = ScreenRay(GetMousePosition(), cam);
             Vector3 t = Vector3Add(ray.position, Vector3Scale(ray.direction, brickGrabDist));
             t.x = Clamp(t.x, -(ARENA - 0.05f - BRICK_HALF.x), ARENA - 0.05f - BRICK_HALF.x);
             t.z = Clamp(t.z, -(ARENA - 0.05f - BRICK_HALF.z), ARENA - 0.05f - BRICK_HALF.z);
@@ -1817,6 +1942,24 @@ int main(int argc, char** argv) {
             while (sleepTick >= SLEEP_INTERVAL) { sleepTick -= SLEEP_INTERVAL; sleepiness -= SLEEP_DROP; }
         }
         sleepiness = Clamp(sleepiness, 0.0f, 100.0f);
+ 
+        // ---- entertainment: drains slowly; refills only while he sits watching with the screen ON ----
+        const bool watchingTV = avatar.Watching();
+        if (watchingTV && screenOn) entertainment += ENT_REGEN * GetFrameTime();
+        else {
+            entTick += GetFrameTime();
+            while (entTick >= ENT_INTERVAL) { entTick -= ENT_INTERVAL; entertainment -= ENT_DROP; }
+        }
+        entertainment = Clamp(entertainment, 0.0f, 100.0f);
+        tvOffTimer = (watchingTV && !screenOn) ? tvOffTimer + GetFrameTime() : 0.0f;
+        if (entertainment >= 100.0f) watchRequested = false;           // not in the mood for TV
+ 
+        // He gets up from the TV when he has had enough, is sleepy, there is food on the floor, or the screen stays off.
+        if (avatar.mode == MODE_TV) {
+            bool foodWaiting = false;
+            for (const Food& f : foods) if (f.state == FOOD_LANDED && f.pos.y <= 0.05f) foodWaiting = true;
+            if (entertainment >= 100.0f || sleepiness <= SLEEPY_AT || foodWaiting || tvOffTimer >= TV_OFF_PATIENCE) avatar.tvRiseRequested = true;
+        }
         // ---- exhaustion: 10 s at zero sleepiness and he drops where he is and falls asleep ----
         if (sleepiness <= 0.0f && !avatar.asleep) zeroSleepTimer += GetFrameTime(); else zeroSleepTimer = 0.0f;
         if (zeroSleepTimer >= PASS_OUT_AFTER) { avatar.PassOut(); zeroSleepTimer = 0.0f; }
@@ -1900,6 +2043,11 @@ int main(int argc, char** argv) {
         // Tired enough (and on his feet)? Walk to the bed.
         if (avatar.mode == MODE_STANDING && sleepiness <= SLEEPY_AT && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f)
             avatar.StartWalkToBed();                            // (a dance in progress finishes first)
+        if (avatar.mode == MODE_STANDING && watchRequested && sleepiness > SLEEPY_AT && entertainment < 100.0f &&
+            avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f) {  // free, rested and wants to watch: off to the TV
+            avatar.StartWatchTV({sg.cx, 0.0f, -ARENA + TV_DISTANCE});
+            watchRequested = false;
+        }
  
         // ---- draw ----
         BeginDrawing();
@@ -1907,7 +2055,7 @@ int main(int argc, char** argv) {
         BeginMode3D(cam);
             DrawArena();
             DrawBed();
-            DrawScreenOnWall(screen, sg, screenOn, screenHover);
+            DrawScreenOnWall(screen, sg, screenOn, screenHover, tvBaseHover);
             for (const Brick& b : bricks) DrawBrick(b);
             for (const Food& f : foods) DrawFood(f, avatar.look.height);
             avatar.Draw();
@@ -1929,6 +2077,8 @@ int main(int argc, char** argv) {
         else if (avatar.mode == MODE_WALK) state = "WALKING TO BED";
         else if (avatar.mode == MODE_FETCH) state = "WALKING TO FOOD";
         else if (avatar.mode == MODE_EAT) state = "EATING";
+        else if (avatar.mode == MODE_TV) state = avatar.tvStage == TV_WALK ? "WALKING TO TV" : avatar.tvStage == TV_SIT ? "SITTING DOWN" :
+                                                 avatar.tvStage == TV_RISE ? "GETTING UP" : (screenOn ? "WATCHING TV" : "STARING AT A DEAD SCREEN");
         else if (avatar.mode == MODE_BEDANIM) state = avatar.bedReverse ? "GETTING OUT OF BED" : "GETTING INTO BED";
         else if (avatar.mode == MODE_RAGDOLL)
             state = avatar.asleep ? (avatar.passedOut ? "PASSED OUT" : "ASLEEP") : avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
@@ -1939,10 +2089,15 @@ int main(int argc, char** argv) {
         DrawStatBar(px, 38, "Mood",   mood,   MoodColor(mood));
         DrawStatBar(px, 64, "Hunger", hunger, {230, 160, 50, 255});
         DrawStatBar(px, 90, "Sleepiness", sleepiness, SleepColor(sleepiness));
-        DrawStatBar(px, 116, "Entertainment", entertainment, {185, 110, 225, 255});   // placeholder
+        DrawStatBar(px, 116, "Entertainment", entertainment, {185, 110, 225, 255});
         if (zeroSleepTimer > 0.0f)
             DrawText(TextFormat("Exhausted - passing out in %.0fs", std::ceil(PASS_OUT_AFTER - zeroSleepTimer)), px, 142, 18, MAROON);
         DrawLine(px + STAT_LX + (int)(160 * SLEEPY_AT / 100.0f), 90, px + STAT_LX + (int)(160 * SLEEPY_AT / 100.0f), 108, WHITE);   // "goes to bed" mark
+        if (tvBaseHover) {                                                // a hint while the mouse is under the screen
+            const Vector2 mp = GetMousePosition();
+            DrawText("Click: sit and watch TV", (int)mp.x + 17, (int)mp.y + 19, 18, BLACK);
+            DrawText("Click: sit and watch TV", (int)mp.x + 16, (int)mp.y + 18, 18, WHITE);
+        }
         if (screenHover) {                                                // a hint while the mouse is over the screen
             const Vector2 mp = GetMousePosition();
             DrawText(screenOn ? "Click: switch the screen off" : "Click: switch the screen on", (int)mp.x + 17, (int)mp.y + 19, 18, BLACK);
