@@ -16,6 +16,10 @@
 //   Drag on empty space (or hold right mouse) to turn the camera      Wheel: zoom
 //   Screen on the -Z wall at his eye level, as wide as he is tall. Click it to switch it on / off. It plays screen.gif
 //   (next to the program, or pass a path as the first argument) at a fixed 10 frames/s; until then a test pattern.
+//   A metal T (pole + a bar 80% of his arm span wide, 2.45 m up so he can't reach it) stands on the floor. Click the pole: he runs circles
+//   round it, one hand on it, and entertainment goes up (he may also do it alone when entertainment is below 35).
+//   The bar ends are magnets: carry him up so a hand comes near an end and it snaps on and stays. Hanging there slowly
+//   drains entertainment and mood. Only YOU can take him down: grab a hand, or pull his body away hard.
 //   Click the wall panel just BELOW the screen: he walks to a spot in front of it, sits on the floor and watches.
 //   Entertainment drains slowly; while he sits watching with the screen ON it refills slowly; with the screen OFF it
 //   does not. He gets up when entertained (100), sleepy, when there is food on the floor, or after 8 s of a dead screen.
@@ -74,8 +78,9 @@ enum Joint {
     JOINT_COUNT
 };
  
-enum Mode { MODE_STANDING, MODE_RAGDOLL, MODE_GETUP, MODE_WALK, MODE_BEDANIM, MODE_FETCH, MODE_EAT, MODE_TV };
+enum Mode { MODE_STANDING, MODE_RAGDOLL, MODE_GETUP, MODE_WALK, MODE_BEDANIM, MODE_FETCH, MODE_EAT, MODE_TV, MODE_POLE };
 enum TvStage { TV_WALK, TV_SIT, TV_WATCH, TV_RISE };   // within MODE_TV
+enum PoleStage { POLE_WALK, POLE_RUN };               // within MODE_POLE
  
 struct Appearance {
     float height = 1.75f;   // metres
@@ -249,6 +254,20 @@ static const float ENT_REGEN       = 2.0f;      // points per second gained whil
 static const float TV_DISTANCE     = 2.8f;      // how far from the wall he stands before sitting down (m)
 static const float TV_SIT_T        = 1.8f;      // seconds to sit down (and to get back up)
 static const float TV_OFF_PATIENCE = 8.0f;      // seconds he keeps staring at a switched-off screen before giving up
+ 
+// The pole: a metal T (vertical pole + a horizontal bar a little shorter than his arm span, high enough to hang from).
+static const float POLE_X = 6.0f, POLE_Z = -5.0f;   // where it stands
+static const float POLE_R = 0.05f;                  // pole radius
+static const float BAR_R  = 0.035f;                 // bar radius
+static const float BAR_SPAN_FRACTION = 0.80f;       // bar length as a fraction of his arm span: a full-width bar leaves his arms nearly horizontal and his head at the bar
+static const float MAGNET_RANGE   = 0.28f;          // a hand this close to a bar end snaps onto it ("magnet")
+static const float MAGNET_RELEASE = 0.45f;          // a hand pulled off must get this far away before it can snap on again
+static const float RUN_RADIUS = 0.62f;              // how far from the pole he runs
+static const float RUN_SPEED  = 2.8f;               // m/s
+static const float POLE_URGE  = 35.0f;              // below this entertainment he may go and run circles by himself (0 = never)
+static const float POLE_REGEN = 3.0f;               // entertainment per second while he runs circles
+static const float HANG_ENT_DRAIN  = 0.75f;         // per hand hanging on the bar, per second
+static const float HANG_MOOD_DRAIN = 0.75f;
 static const float PASS_OUT_AFTER = 10.0f;  // seconds at zero sleepiness before he collapses and sleeps where he stands
 static const float FETCH_STOP = 0.34f;      // how far from the food he stops before crouching (m)
 static const bool  HEIGHT_KEYS = false;     // the height keys are switched off for now
@@ -332,6 +351,17 @@ struct Ragdoll {
     Vector3 foodPos = {0, 0, 0};               // where the held disk is (read by the game loop)
     bool    foodEaten = false;                 // set when the disk has been eaten (game loop clears it)
  
+    // The pole: running circles around it, and hanging by hands magnetised to the ends of the bar
+    Vector3 poleBase = {0, 0, 0};
+    int     poleStage = POLE_WALK;
+    float   poleT = 0.0f;
+    bool    poleStopRequested = false;         // the game loop asks him to stop running (he slows down first)
+    float   runFrac = 0.0f;                    // 0..1 of full running speed
+    float   grabW = 0.0f;                      // 0..1: how firmly his right hand is on the pole
+    bool    handAttached[2] = {false, false};  // [0] = left hand, [1] = right hand: stuck to a bar end
+    Vector3 handAnchor[2] = {{0, 0, 0}, {0, 0, 0}};
+    bool    magnetLocked[2] = {false, false};  // just pulled off: can't snap back on until it has moved away
+ 
     // Watching TV
     Vector3 tvSpot = {0, 0, 0};                // where he stands (facing the screen) before sitting down
     int     tvStage = TV_WALK;
@@ -352,7 +382,8 @@ struct Ragdoll {
     bool  cryBurstDone = false;                // already cried this window
     bool  asleep   = false;
  
-    bool  Pinned(int i) const { return mode == MODE_STANDING || mode == MODE_WALK || mode == MODE_BEDANIM || mode == MODE_FETCH || mode == MODE_EAT || mode == MODE_TV || i == grabbed; }
+    bool  Pinned(int i) const { return mode == MODE_STANDING || mode == MODE_WALK || mode == MODE_BEDANIM || mode == MODE_FETCH || mode == MODE_EAT || mode == MODE_TV || mode == MODE_POLE || i == grabbed ||
+                                (i == L_HAND && handAttached[0]) || (i == R_HAND && handAttached[1]); }
     float Radius(int j) const { return (j == HEAD ? 0.065f : 0.03f) * look.height; }
     float Bone(int a, int b) const { return Vector3Distance(rest[a], rest[b]); }
  
@@ -504,7 +535,9 @@ struct Ragdoll {
     void Stand() {
         mode = MODE_STANDING; grabbed = -1; groundTimer = 0.0f; getupT = 0.0f;
         bedTimer = 0.0f; asleep = false; passedOut = false; walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f; bedT = 0.0f; bedReverse = false;
-        foodHeld = false; tvRiseRequested = false; danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; cryWindowT = 0.0f; cryBurstT = 0.0f; cryBurstDone = false; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
+        foodHeld = false; tvRiseRequested = false; poleStopRequested = false;
+        handAttached[0] = handAttached[1] = false; magnetLocked[0] = magnetLocked[1] = false;
+        danceT = 0.0f; danceBlend = 0.0f; cryBlend = 0.0f; cryWindowT = 0.0f; cryBurstT = 0.0f; cryBurstDone = false; nextDanceIn = (float)GetRandomValue(30, 100) / 10.0f;
         ComputePose(KEY_STAND, origin, yaw, pos);
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
     }
@@ -514,7 +547,7 @@ struct Ragdoll {
     // Switch to physics. `push` gives the upper body a shove so it topples.
     void GoLimp(bool push) {
         for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
-        mode = MODE_RAGDOLL; groundTimer = 0.0f; getupT = 0.0f; bedReverse = false; tvRiseRequested = false;
+        mode = MODE_RAGDOLL; groundTimer = 0.0f; getupT = 0.0f; bedReverse = false; tvRiseRequested = false; poleStopRequested = false;
         if (push) {
             float a = (float)GetRandomValue(0, 628) / 100.0f;
             Vector3 dir = {std::sin(a), 0.0f, std::cos(a)};
@@ -599,6 +632,15 @@ struct Ragdoll {
             const float lim = ARENA - 0.07f * look.height;   // keep the body inside the walls
             pos[i].x = Clamp(pos[i].x, -lim, lim);
             pos[i].z = Clamp(pos[i].z, -lim, lim);
+        }
+        // Hanging from the magnets: he can't pull himself up, so his shoulders stay below his hands.
+        if (HandsAttached() > 0) {
+            float ceiling = 1e9f;
+            for (int h = 0; h < 2; h++) if (handAttached[h]) ceiling = std::min(ceiling, handAnchor[h].y - 0.10f);
+            for (int sIdx : {L_SHO, R_SHO}) if (!Pinned(sIdx)) pos[sIdx].y = std::min(pos[sIdx].y, ceiling);
+            // ...and the rest of him stays below his shoulders: he can't flip up and over the bar
+            const float shoY = std::min(pos[L_SHO].y, pos[R_SHO].y) - 0.10f;
+            for (int j : {PELVIS, L_HIP, R_HIP, L_KNEE, R_KNEE, L_FOOT, R_FOOT}) if (!Pinned(j)) pos[j].y = std::min(pos[j].y, shoY);
         }
     }
  
@@ -694,6 +736,8 @@ struct Ragdoll {
             }
         }
  
+        for (int h = 0; h < 2; h++)                            // magnetised hands stay exactly on the bar end
+            if (handAttached[h]) { const int j = (h == 0) ? L_HAND : R_HAND; pos[j] = handAnchor[h]; prev[j] = handAnchor[h]; }
         for (int it = 0; it < ITERS; it++) { SolveSticks(); FloorClamp(); }
         for (int i = 0; i < JOINT_COUNT; i++) {              // friction (once per step)
             if (Pinned(i)) continue;
@@ -719,7 +763,7 @@ struct Ragdoll {
             Vector3 bUp, bFwd; BodyFrame(bUp, bFwd);
             const float pelvisSpeed = Vector3Length(Vector3Subtract(pos[PELVIS], prev[PELVIS])) / dt;
             const bool lyingStill = std::fabs(bUp.y) < 0.6f && pelvisSpeed < 0.3f && !OverBed(pos[PELVIS]);   // e.g. draped over the bricks
-            if (!passedOut && grabbed < 0 && (pos[PELVIS].y < 0.20f * look.height || lyingStill)) groundTimer += dt;
+            if (!passedOut && grabbed < 0 && HandsAttached() == 0 && (pos[PELVIS].y < 0.20f * look.height || lyingStill)) groundTimer += dt;   // (never while hanging)
             else groundTimer = 0.0f;
         }
         if (groundTimer >= FALL_WAIT) BeginGetUp();
@@ -883,6 +927,108 @@ struct Ragdoll {
         }
         if (!foodEaten && eatT >= tChew) { foodEaten = true; foodHeld = false; }
         if (eatT >= tReturn) Stand();
+    }
+ 
+    // ------------------------------------------------------------------------
+    // The pole: run circles around it with one hand on it
+    // ------------------------------------------------------------------------
+    int  HandsAttached() const { return (handAttached[0] ? 1 : 0) + (handAttached[1] ? 1 : 0); }
+    void DetachHand(int h) { handAttached[h] = false; magnetLocked[h] = true; }
+ 
+    // Length of the shortest rigid path through his body between two joints: how far apart they can ever get.
+    float ChainLength(int from, int to) const {
+        float dist[JOINT_COUNT]; bool done[JOINT_COUNT];
+        for (int i = 0; i < JOINT_COUNT; i++) { dist[i] = 1e9f; done[i] = false; }
+        dist[from] = 0.0f;
+        for (int it = 0; it < JOINT_COUNT; it++) {
+            int u = -1;
+            for (int i = 0; i < JOINT_COUNT; i++) if (!done[i] && (u < 0 || dist[i] < dist[u])) u = i;
+            if (u < 0 || dist[u] >= 1e9f) break;
+            done[u] = true;
+            for (const Stick& st : sticks) {
+                if (st.hi - st.lo > 1e-6f) continue;                                   // only the rigid bones
+                const int v = (st.a == u) ? st.b : (st.b == u ? st.a : -1);
+                if (v >= 0 && dist[u] + st.lo < dist[v]) dist[v] = dist[u] + st.lo;
+            }
+        }
+        return dist[to];
+    }
+    bool Running() const { return mode == MODE_POLE && poleStage == POLE_RUN; }
+ 
+    void StartPoleRun(Vector3 base) {
+        mode = MODE_POLE; grabbed = -1;
+        poleBase = base; poleStage = POLE_WALK; poleT = 0.0f; poleStopRequested = false;
+        runFrac = 0.0f; grabW = 0.0f;
+        walkStage = 0; gaitPhase = 0.0f; gaitAmp = 0.0f;
+        danceT = 0.0f; danceBlend = 0.0f;
+    }
+ 
+    // The running pose: the pole is on his right, his right hand on it, the other arm and the legs pumping.
+    void ApplyRunPose(float dt) {
+        const float H = look.height;
+        gaitPhase += (5.5f + 4.5f * runFrac) * dt;                      // quicker steps the faster he goes
+        const float strength = 1.6f * runFrac;
+        PoseKey k = KEY_STAND;
+        k.pelvisY = 0.515f - (0.022f + 0.012f * std::fabs(std::sin(gaitPhase))) * strength;
+        k.lean = 9.0f * runFrac;
+        PoseTweak tw;
+        tw.rHandAt = {-(RUN_RADIUS - POLE_R - 0.02f) / H, 1.15f / H, 0.0f};
+        tw.rHandAtW = grabW; tw.rBendDown = 0.6f * grabW;
+        ComputePose(k, origin, yaw, pos, gaitPhase, strength, &tw);
+        for (int i = 0; i < JOINT_COUNT; i++) prev[i] = pos[i];
+    }
+ 
+    void StepPole(float dt) {
+        const float R = RUN_RADIUS;
+        if (poleStage == POLE_WALK) {
+            float ux = origin.x - poleBase.x, uz = origin.z - poleBase.z;
+            float ul = std::sqrt(ux * ux + uz * uz);
+            if (ul < 1e-4f) { ux = 1.0f; uz = 0.0f; ul = 1.0f; }
+            ux /= ul; uz /= ul;
+            const Vector3 entry = {poleBase.x + ux * R, 0.0f, poleBase.z + uz * R};      // the nearest spot on his running circle
+            if (walkStage == 0) walkStage = SegmentHitsBed(origin, entry, 0.4f) ? 1 : 2;
+            const bool toEntry = (walkStage == 2);
+            const Vector3 goal = toEntry ? entry : CornerSpot();
+            const float dx = goal.x - origin.x, dz = goal.z - origin.z;
+            const float dist = std::sqrt(dx * dx + dz * dz);
+            const float remaining = toEntry ? dist : dist - 0.05f;
+            if (!toEntry && remaining <= 0.003f) { walkStage = 2; return; }
+ 
+            if (poleStopRequested) {                                                     // asked to stop before he even started
+                ApplyWalkPose(dt, false, true, true);
+                if (gaitAmp < 0.05f && cryBlend < 0.01f) { poleStopRequested = false; Stand(); }
+                return;
+            }
+            const bool arrived = remaining <= 0.003f;
+            const float tangentYaw = std::atan2(-uz, ux);                                // facing along the circle, pole on his right
+            const float wantYaw = (toEntry && arrived) ? tangentYaw : (dist > 1e-4f ? std::atan2(dx, dz) : yaw);
+            const float dyaw = WrapPi(wantYaw - yaw);
+            const float maxTurn = TURN_RATE * dt;
+            yaw += Clamp(dyaw, -maxTurn, maxTurn);
+            const bool moving = !arrived && std::fabs(dyaw) < 0.6f;
+            if (moving) {
+                const float step = std::min(WALK_SPEED * dt, std::max(remaining, 0.0f));
+                origin.x += std::sin(yaw) * step;
+                origin.z += std::cos(yaw) * step;
+            }
+            ApplyWalkPose(dt, moving, arrived, arrived && toEntry);
+            if (toEntry && arrived && std::fabs(WrapPi(tangentYaw - yaw)) < 0.05f && gaitAmp < 0.05f && cryBlend < 0.01f) {
+                origin = entry; yaw = tangentYaw;
+                poleStage = POLE_RUN; runFrac = 0.0f; grabW = 0.0f; poleT = 0.0f;
+            }
+            return;
+        }
+ 
+        // POLE_RUN: round and round, hand on the pole
+        poleT += dt;
+        const float wantSpeed = poleStopRequested ? 0.0f : 1.0f;
+        runFrac += Clamp(wantSpeed - runFrac, -1.25f * dt, 0.9f * dt);                 // speeds up over ~1 s, slows over ~0.8 s
+        const float wantGrab = (poleStopRequested && runFrac < 0.05f) ? 0.0f : 1.0f;   // lets go once he has almost stopped
+        grabW += Clamp(wantGrab - grabW, -3.3f * dt, 3.3f * dt);
+        yaw -= (RUN_SPEED * runFrac / R) * dt;                                         // pole on the right: the heading turns clockwise
+        origin = {poleBase.x + R * std::cos(yaw), 0.0f, poleBase.z - R * std::sin(yaw)};
+        ApplyRunPose(dt);
+        if (poleStopRequested && runFrac < 0.01f && grabW < 0.01f) { poleStopRequested = false; Stand(); }
     }
  
     // ------------------------------------------------------------------------
@@ -1121,6 +1267,7 @@ struct Ragdoll {
         else if (mode == MODE_FETCH) StepFetch(dt);
         else if (mode == MODE_EAT) StepEat(dt);
         else if (mode == MODE_TV) StepTV(dt);
+        else if (mode == MODE_POLE) StepPole(dt);
     }
  
     void Release() {
@@ -1431,7 +1578,7 @@ static void ExitThroughFace(const std::vector<Brick>& bricks, const Brick& self,
 //  jointVel = how fast each of his joints moved this frame (m/s).
 static void ResolveAvatarBricks(Ragdoll& av, std::vector<Brick>& bricks, const Vector3 jointVel[JOINT_COUNT], float frameDt) {
     // posed = driven by an animation that cannot be shoved (a ragdoll or a get-up can be pushed)
-    const bool posed = (av.mode == MODE_STANDING || av.mode == MODE_WALK || av.mode == MODE_BEDANIM || av.mode == MODE_FETCH || av.mode == MODE_EAT || av.mode == MODE_TV);
+    const bool posed = (av.mode == MODE_STANDING || av.mode == MODE_WALK || av.mode == MODE_BEDANIM || av.mode == MODE_FETCH || av.mode == MODE_EAT || av.mode == MODE_TV || av.mode == MODE_POLE);
     Probe probes[48];
     const int np = av.BodyProbes(probes);
  
@@ -1685,6 +1832,116 @@ static void DrawScreenOnWall(const ScreenMedia& m, const ScreenGeom& g, bool on,
     }
 }
  
+// ----------------------------------------------------------------------------
+// The pole: a metal T. A vertical pole with a horizontal bar across the top, as wide as (a little under) his arm
+// span and too high to reach from the floor. Two things happen here:
+//  - he may grab the pole and run circles around it (entertainment goes up), and
+//  - the ends of the bar are magnets: a hand that comes close snaps on and stays. Hanging there slowly wears
+//    down his entertainment and mood, and only the user can take him down (grab a hand, or pull him away).
+// ----------------------------------------------------------------------------
+struct PoleGeom { Vector3 base; float height; float halfSpan; Vector3 end[2]; };   // end[0] = -X end, end[1] = +X end
+ 
+static PoleGeom MakePoleGeom(const Appearance& a) {
+    PoleGeom g;
+    g.base = {POLE_X, 0.0f, POLE_Z};
+    g.height = 1.40f * a.height;                                              // hands overhead only reach ~1.14 x his height
+    const float armSpan = 2.0f * (0.11f * a.build + 0.322f) * a.height;        // hand to hand, arms straight out
+    g.halfSpan = 0.5f * BAR_SPAN_FRACTION * armSpan;
+    g.end[0] = {g.base.x - g.halfSpan, g.height, g.base.z};
+    g.end[1] = {g.base.x + g.halfSpan, g.height, g.base.z};
+    return g;
+}
+ 
+// Hands that come near a bar end snap onto it. A hand stays until the user takes it off: by grabbing it
+// (Ragdoll::DetachHand) or by pulling his body away hard enough.
+static void UpdateMagnets(Ragdoll& av, const PoleGeom& pg) {
+    if (av.mode != MODE_RAGDOLL) return;
+    const int hands[2] = {L_HAND, R_HAND}, sho[2] = {L_SHO, R_SHO}, elb[2] = {L_ELB, R_ELB};
+    for (int h = 0; h < 2; h++) {
+        const int j = hands[h];
+        if (av.handAttached[h]) {
+            bool torn = false;
+            if (av.grabbed >= 0 && av.grabbed != j) {          // the user is pulling on another part of him: is it more than the body can stretch?
+                const float tension = Vector3Distance(av.handAnchor[h], av.pos[av.grabbed]) - av.ChainLength(j, av.grabbed);
+                if (tension > 0.15f) torn = true;
+            }
+            const float arm = av.Bone(sho[h], elb[h]) + av.Bone(elb[h], j);
+            if (Vector3Distance(av.pos[sho[h]], av.handAnchor[h]) > arm + 0.25f) torn = true;
+            if (torn) av.DetachHand(h);                          // yanked off the magnet
+            continue;
+        }
+        int best = -1; float bd = 1e9f;                                             // nearest end that is not already taken
+        for (int e = 0; e < 2; e++) {
+            bool taken = false;
+            for (int o = 0; o < 2; o++) if (o != h && av.handAttached[o] && Vector3Distance(av.handAnchor[o], pg.end[e]) < 0.01f) taken = true;
+            const float d = Vector3Distance(av.pos[j], pg.end[e]);
+            if (!taken && d < bd) { bd = d; best = e; }
+        }
+        if (av.magnetLocked[h]) {                                                    // let go on purpose: stay free until well clear
+            float dn = 1e9f; for (int e = 0; e < 2; e++) dn = std::min(dn, Vector3Distance(av.pos[j], pg.end[e]));
+            if (dn > MAGNET_RELEASE) av.magnetLocked[h] = false;
+            continue;
+        }
+        if (best >= 0 && bd < MAGNET_RANGE) {                                        // click!
+            av.handAttached[h] = true;
+            av.handAnchor[h] = pg.end[best];
+            av.pos[j] = av.prev[j] = pg.end[best];
+            if (av.grabbed == j) av.grabbed = -1;                                    // the mouse's hold is replaced by the magnet's
+        }
+    }
+}
+ 
+// The pole is solid for a ragdoll: his body parts are pushed out of it (so hanging from the bar he hangs beside the pole).
+static void ResolveAvatarPole(Ragdoll& av, const PoleGeom& pg) {
+    if (av.mode != MODE_RAGDOLL && av.mode != MODE_GETUP) return;
+    Probe probes[48];
+    const int np = av.BodyProbes(probes);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < np; i++) {
+            const Probe& pr = probes[i];
+            const Vector3 p = Vector3Lerp(av.pos[pr.a], av.pos[pr.b], pr.t);
+            // the bar (a capsule between the two ends) and the pole (a vertical cylinder): whichever he is touching pushes him out
+            Vector3 n = {0.0f, 0.0f, 0.0f}; float depth = 0.0f;
+            {
+                const Vector3 ab = Vector3Subtract(pg.end[1], pg.end[0]);
+                const float tt = Clamp(Vector3DotProduct(Vector3Subtract(p, pg.end[0]), ab) / Vector3DotProduct(ab, ab), 0.0f, 1.0f);
+                const Vector3 q = Vector3Add(pg.end[0], Vector3Scale(ab, tt));
+                const Vector3 d = Vector3Subtract(p, q);
+                const float dist = Vector3Length(d), need = pr.r + BAR_R;
+                if (dist < need) { n = dist > 1e-5f ? Vector3Scale(d, 1.0f / dist) : Vector3{0.0f, -1.0f, 0.0f}; depth = need - dist; }
+            }
+            if (depth <= 0.0f && p.y <= pg.height) {
+                const float dx = p.x - pg.base.x, dz = p.z - pg.base.z;
+                const float dist = std::sqrt(dx * dx + dz * dz), need = pr.r + POLE_R;
+                if (dist < need) { n = dist > 1e-5f ? Vector3{dx / dist, 0.0f, dz / dist} : Vector3{0.0f, 0.0f, 1.0f}; depth = need - dist; }
+            }
+            if (depth <= 0.0f) continue;
+            const float wa = (1.0f - pr.t), wb = pr.t;
+            const float norm = (pr.a == pr.b) ? 1.0f : 1.0f / (wa * wa + wb * wb);
+            const int ends[2] = {pr.a, pr.b};
+            const float ws[2] = {(pr.a == pr.b) ? 1.0f : wa, (pr.a == pr.b) ? 0.0f : wb};
+            for (int e = 0; e < 2; e++) {
+                if (ws[e] <= 0.0f || av.Pinned(ends[e])) continue;
+                av.pos[ends[e]] = Vector3Add(av.pos[ends[e]], Vector3Scale(n, depth * ws[e] * norm));
+            }
+        }
+    }
+}
+ 
+static void DrawPoleT(const PoleGeom& g, const Ragdoll& av, bool hover) {
+    const Color metal = {172, 178, 190, 255}, metalDark = {105, 110, 122, 255};
+    DrawCylinder({g.base.x, 0.0f, g.base.z}, 0.32f, 0.32f, 0.03f, 32, metalDark);                       // base plate
+    DrawCylinder({g.base.x, 0.03f, g.base.z}, POLE_R, POLE_R, g.height - 0.03f, 20, metal);            // the pole
+    DrawCylinderEx(g.end[0], g.end[1], BAR_R, BAR_R, 16, metal);                                       // the bar
+    DrawSphere({g.base.x, g.height, g.base.z}, POLE_R * 1.3f, metalDark);                              // the joint
+    for (int e = 0; e < 2; e++) {                                                                      // the magnetic ends
+        bool used = false;
+        for (int h = 0; h < 2; h++) if (av.handAttached[h] && Vector3Distance(av.handAnchor[h], g.end[e]) < 0.01f) used = true;
+        DrawSphere(g.end[e], 0.05f, used ? Color{255, 140, 60, 255} : Color{70, 120, 240, 255});
+    }
+    if (hover) DrawCylinderWires({g.base.x, 0.0f, g.base.z}, POLE_R * 1.8f, POLE_R * 1.8f, g.height, 12, WHITE);
+}
+ 
 static void DrawFood(const Food& f, float H) {
     const float r = 0.03f * H, th = 0.012f * H;            // a disk the size of his hand
     const Vector3 base = {f.pos.x, f.pos.y - th * 0.5f, f.pos.z};
@@ -1721,6 +1978,7 @@ int main(int argc, char** argv) {
     float entertainment = 100.0f;           // drains slowly; refills while he watches the TV with the screen on
     float entTick = 0.0f;                   // counts up to ENT_INTERVAL, then entertainment drops
     bool  watchRequested = false;           // the click under the TV is waiting for him to be free
+    bool  poleRequested = false;            // the click on the pole is waiting for him to be free
     float tvOffTimer = 0.0f;                // seconds he has been staring at a switched-off screen
     float moodTick = 0.0f;                  // counts up to MOOD_REGEN_INTERVAL, then mood recovers by 1 point
     float sleepiness = 100.0f;              // 100 = rested (light blue), 0 = exhausted (dark blue)
@@ -1747,7 +2005,8 @@ int main(int argc, char** argv) {
             p.z = (float)GetRandomValue((int)(-L * 100), (int)(L * 100)) / 100.0f;
             const bool nearBed  = p.x > BED.min.x - 1.0f && p.z > BED.min.z - 1.0f;
             const bool nearPile = p.x < PILE_X0 + PILE_W + 1.0f && p.z < PILE_Z0 + PILE_LEN + 1.0f;
-            if (!nearBed && !nearPile) break;
+            const bool nearPole = std::fabs(p.x - POLE_X) < 1.5f && std::fabs(p.z - POLE_Z) < 1.5f;
+            if (!nearBed && !nearPile && !nearPole) break;
         }
         foods.push_back({p, {0.0f, 0.0f, 0.0f}, FOOD_FALLING});
     };
@@ -1799,7 +2058,7 @@ int main(int argc, char** argv) {
  
         // ---- pose / physics control ----
         if (IsKeyPressed(KEY_R)) avatar.HardReset();
-        if (IsKeyPressed(KEY_SPACE) && (avatar.mode == MODE_STANDING || avatar.mode == MODE_WALK || avatar.mode == MODE_FETCH || avatar.mode == MODE_EAT || avatar.mode == MODE_TV)) avatar.GoLimp(true);   // knock over
+        if (IsKeyPressed(KEY_SPACE) && (avatar.mode == MODE_STANDING || avatar.mode == MODE_WALK || avatar.mode == MODE_FETCH || avatar.mode == MODE_EAT || avatar.mode == MODE_TV || avatar.mode == MODE_POLE)) avatar.GoLimp(true);   // knock over
         if (IsKeyPressed(KEY_B)) mood = 5.0f;                                      // test shortcuts: miserable (continuous crying) ...
         if (IsKeyPressed(KEY_M)) mood = 15.0f;                                     // ... sad (occasional 1 s cry) ...
         if (IsKeyPressed(KEY_N)) mood = 100.0f;                                    // ... and happy (dances)
@@ -1814,6 +2073,11 @@ int main(int argc, char** argv) {
         const bool screenHover = screenDist >= 0.0f && !overBtn;
         const float tvBaseDist = TvBaseHitDistance(mouseRay, sg);          // the wall under the screen
         const bool tvBaseHover = tvBaseDist >= 0.0f && !overBtn && !screenHover;
+        const PoleGeom pg = MakePoleGeom(avatar.look);
+        const BoundingBox poleBox = {{pg.base.x - 0.14f, 0.0f, pg.base.z - 0.14f}, {pg.base.x + 0.14f, pg.height, pg.base.z + 0.14f}};
+        const RayCollision poleHit = GetRayCollisionBox(mouseRay, poleBox);
+        const float poleDist = poleHit.hit ? poleHit.distance : -1.0f;
+        const bool poleHover = poleDist >= 0.0f && !overBtn && !screenHover && !tvBaseHover;
  
         // ---- mouse grab ----
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiClick) {
@@ -1835,11 +2099,13 @@ int main(int argc, char** argv) {
                 RayCollision c = GetRayCollisionBox(ray, BrickBounds(bricks[i]));
                 if (c.hit && c.distance < bestBrick) { bestBrick = c.distance; hitBrick = (int)i; }
             }
-            const bool screenFirst = screenDist >= 0.0f && screenDist < best && screenDist < bestFood && screenDist < bestBrick;
+            const bool screenFirst = screenDist >= 0.0f && screenDist < best && screenDist < bestFood && screenDist < bestBrick && (poleDist < 0.0f || screenDist < poleDist);
             if (screenFirst) {
                 screenOn = !screenOn;                                    // click the screen: on / off
-            } else if (tvBaseDist >= 0.0f && tvBaseDist < best && tvBaseDist < bestFood && tvBaseDist < bestBrick) {
+            } else if (tvBaseDist >= 0.0f && tvBaseDist < best && tvBaseDist < bestFood && tvBaseDist < bestBrick && (poleDist < 0.0f || tvBaseDist < poleDist)) {
                 if (!avatar.asleep && avatar.mode != MODE_TV) watchRequested = true;    // click under the TV: go and watch it
+            } else if (poleDist >= 0.0f && poleDist < best && poleDist < bestFood && poleDist < bestBrick) {
+                if (!avatar.asleep && avatar.mode != MODE_POLE && avatar.HandsAttached() == 0) poleRequested = true;   // click the pole: run circles round it
             } else if (hitBrick >= 0 && bestBrick < best && bestBrick < bestFood) {   // a brick is the nearest thing under the cursor
                 grabbedBrick = hitBrick; brickGrabDist = bestBrick;
                 bricks[hitBrick].state = BRICK_DRAGGED; bricks[hitBrick].vel = {0.0f, 0.0f, 0.0f};
@@ -1849,6 +2115,8 @@ int main(int argc, char** argv) {
             } else if (hit >= 0) {
                 if (avatar.mode != MODE_RAGDOLL) avatar.GoLimp(false);   // grabbing cancels a get-up too
                 avatar.grabbed = hit;
+                if (hit == L_HAND && avatar.handAttached[0]) avatar.DetachHand(0);        // taking a hand off the magnet
+                if (hit == R_HAND && avatar.handAttached[1]) avatar.DetachHand(1);
                 grabDist = best;
             } else {
                 draggingCam = true;                                      // missed the avatar: turn the camera
@@ -1946,19 +2214,30 @@ int main(int argc, char** argv) {
         // ---- entertainment: drains slowly; refills only while he sits watching with the screen ON ----
         const bool watchingTV = avatar.Watching();
         if (watchingTV && screenOn) entertainment += ENT_REGEN * GetFrameTime();
+        else if (avatar.Running()) entertainment += POLE_REGEN * GetFrameTime();          // running circles round the pole
         else {
             entTick += GetFrameTime();
             while (entTick >= ENT_INTERVAL) { entTick -= ENT_INTERVAL; entertainment -= ENT_DROP; }
         }
+        const int hanging = avatar.HandsAttached();                                       // hanging on the magnets: slowly wearing him down
+        if (hanging > 0) {
+            entertainment -= HANG_ENT_DRAIN * hanging * GetFrameTime();
+            mood = Clamp(mood - HANG_MOOD_DRAIN * hanging * GetFrameTime(), 0.0f, 100.0f);
+        }
         entertainment = Clamp(entertainment, 0.0f, 100.0f);
         tvOffTimer = (watchingTV && !screenOn) ? tvOffTimer + GetFrameTime() : 0.0f;
-        if (entertainment >= 100.0f) watchRequested = false;           // not in the mood for TV
+        if (entertainment >= 100.0f) { watchRequested = false; poleRequested = false; }   // not in the mood for TV or the pole
  
         // He gets up from the TV when he has had enough, is sleepy, there is food on the floor, or the screen stays off.
         if (avatar.mode == MODE_TV) {
             bool foodWaiting = false;
             for (const Food& f : foods) if (f.state == FOOD_LANDED && f.pos.y <= 0.05f) foodWaiting = true;
             if (entertainment >= 100.0f || sleepiness <= SLEEPY_AT || foodWaiting || tvOffTimer >= TV_OFF_PATIENCE) avatar.tvRiseRequested = true;
+        }
+        if (avatar.mode == MODE_POLE) {                                // he stops running when entertained, sleepy, or there is food
+            bool foodWaiting = false;
+            for (const Food& f : foods) if (f.state == FOOD_LANDED && f.pos.y <= 0.05f) foodWaiting = true;
+            if (entertainment >= 100.0f || sleepiness <= SLEEPY_AT || foodWaiting) avatar.poleStopRequested = true;
         }
         // ---- exhaustion: 10 s at zero sleepiness and he drops where he is and falls asleep ----
         if (sleepiness <= 0.0f && !avatar.asleep) zeroSleepTimer += GetFrameTime(); else zeroSleepTimer = 0.0f;
@@ -2039,6 +2318,8 @@ int main(int argc, char** argv) {
             }
             ResolveAvatarBricks(avatar, bricks, avatarVel, fdt);
         }
+        UpdateMagnets(avatar, pg);                                      // hands snap onto the bar ends
+        ResolveAvatarPole(avatar, pg);                                  // the pole is solid for a ragdoll
  
         // Tired enough (and on his feet)? Walk to the bed.
         if (avatar.mode == MODE_STANDING && sleepiness <= SLEEPY_AT && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f)
@@ -2048,6 +2329,11 @@ int main(int argc, char** argv) {
             avatar.StartWatchTV({sg.cx, 0.0f, -ARENA + TV_DISTANCE});
             watchRequested = false;
         }
+        if (avatar.mode == MODE_STANDING && (poleRequested || (POLE_URGE > 0.0f && entertainment <= POLE_URGE)) &&
+            sleepiness > SLEEPY_AT && entertainment < 100.0f && avatar.danceT <= 0.0f && avatar.danceBlend < 0.02f) {
+            avatar.StartPoleRun(pg.base);                              // bored (or sent): off to run circles round the pole
+            poleRequested = false;
+        }
  
         // ---- draw ----
         BeginDrawing();
@@ -2056,6 +2342,7 @@ int main(int argc, char** argv) {
             DrawArena();
             DrawBed();
             DrawScreenOnWall(screen, sg, screenOn, screenHover, tvBaseHover);
+            DrawPoleT(pg, avatar, poleHover);
             for (const Brick& b : bricks) DrawBrick(b);
             for (const Food& f : foods) DrawFood(f, avatar.look.height);
             avatar.Draw();
@@ -2077,11 +2364,13 @@ int main(int argc, char** argv) {
         else if (avatar.mode == MODE_WALK) state = "WALKING TO BED";
         else if (avatar.mode == MODE_FETCH) state = "WALKING TO FOOD";
         else if (avatar.mode == MODE_EAT) state = "EATING";
+        else if (avatar.mode == MODE_POLE) state = avatar.poleStage == POLE_WALK ? "WALKING TO THE POLE" : "RUNNING CIRCLES";
         else if (avatar.mode == MODE_TV) state = avatar.tvStage == TV_WALK ? "WALKING TO TV" : avatar.tvStage == TV_SIT ? "SITTING DOWN" :
                                                  avatar.tvStage == TV_RISE ? "GETTING UP" : (screenOn ? "WATCHING TV" : "STARING AT A DEAD SCREEN");
         else if (avatar.mode == MODE_BEDANIM) state = avatar.bedReverse ? "GETTING OUT OF BED" : "GETTING INTO BED";
         else if (avatar.mode == MODE_RAGDOLL)
-            state = avatar.asleep ? (avatar.passedOut ? "PASSED OUT" : "ASLEEP") : avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
+            state = avatar.HandsAttached() > 0 ? "HANGING (only you can take him down)" :
+                    avatar.asleep ? (avatar.passedOut ? "PASSED OUT" : "ASLEEP") : avatar.groundTimer > 0.0f ? TextFormat("DOWN - getting up in %.1fs", FALL_WAIT - avatar.groundTimer)
                                               : "RAGDOLL";
         DrawText(TextFormat("height %.2f m   build %.1f   %s", look.height, look.build, state), 12, 12, 18, DARKGRAY);
  
@@ -2093,6 +2382,11 @@ int main(int argc, char** argv) {
         if (zeroSleepTimer > 0.0f)
             DrawText(TextFormat("Exhausted - passing out in %.0fs", std::ceil(PASS_OUT_AFTER - zeroSleepTimer)), px, 142, 18, MAROON);
         DrawLine(px + STAT_LX + (int)(160 * SLEEPY_AT / 100.0f), 90, px + STAT_LX + (int)(160 * SLEEPY_AT / 100.0f), 108, WHITE);   // "goes to bed" mark
+        if (poleHover) {                                                  // a hint while the mouse is over the pole
+            const Vector2 mp = GetMousePosition();
+            DrawText("Click: run circles round the pole", (int)mp.x + 17, (int)mp.y + 19, 18, BLACK);
+            DrawText("Click: run circles round the pole", (int)mp.x + 16, (int)mp.y + 18, 18, WHITE);
+        }
         if (tvBaseHover) {                                                // a hint while the mouse is under the screen
             const Vector2 mp = GetMousePosition();
             DrawText("Click: sit and watch TV", (int)mp.x + 17, (int)mp.y + 19, 18, BLACK);
